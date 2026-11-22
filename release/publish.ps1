@@ -25,8 +25,11 @@ if (-not $fileVersion.StartsWith($version)) { throw "release\out\GMS Co-op.exe i
 $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
 [IO.File]::WriteAllText($sha, "$hash  GMS Co-op.exe`n", (New-Object Text.UTF8Encoding($false)))
 
+$prevPref = $ErrorActionPreference; $ErrorActionPreference = "Continue"  # gh writes "release not found" to stderr
 $existing = gh release view $tag --repo $repo 2>$null
-if ($LASTEXITCODE -eq 0) { throw "Release $tag already exists in $repo. Bump the version (Plugin.cs) before publishing again." }
+$viewExit = $LASTEXITCODE
+$ErrorActionPreference = $prevPref
+if ($viewExit -eq 0) { throw "Release $tag already exists in $repo. Bump the version (Plugin.cs) before publishing again." }
 
 if ($Notes -eq "") { $Notes = "GMS Co-op $tag" }
 gh release create $tag $exe $sha --repo $repo --title "GMS Co-op $tag" --notes $Notes --latest
