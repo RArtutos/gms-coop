@@ -390,7 +390,7 @@ namespace GMSCoopInstaller
             var join = new StackPanel();
             join.Children.Add(CardHead(Ui.IconUsers, "Unirse"));
             join.Children.Add(new TextBlock { Text = "Pega el código que te pasó tu amigo. En la misma red, déjalo vacío y se encuentra solo.", Foreground = Ui.Muted, FontSize = 14, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 14) });
-            var code = Ui.Input("Código de partida o IP");
+            var code = Ui.Input("Código de partida o IP", 16);
             code.Text = Settings.Get("code");
             var row = new Grid();
             row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });

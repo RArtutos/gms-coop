@@ -147,12 +147,15 @@ El launcher las pasa solas; sirven también para atajos o pruebas.
 - **Mundo**:
   - interruptores, palancas y puertas;
   - viajes rápidos desbloqueados, notas, puentes, cofres y calabazas;
+  - cofres de temporada (Pascua, Navidad, Halloween): si uno lo abre, se ve abierto en todos los PCs y el premio se da una sola vez;
+  - el perro de la base: está despierto mientras cualquier jugador esté cerca, y todos ven y oyen cuando alguien lo acaricia, le da de comer o ladra;
   - la fragua;
   - explosiones;
   - pintura;
   - tanques y pedidos de combustible;
   - rayos (el mismo daño en todos los PCs);
   - osos (solo los decide el host).
+- **Sonidos de los demás**: escuchas lo que hacen los otros jugadores desde donde están, más bajo si están lejos y con dirección: la pala al excavar y tirar tierra, la batea, las herramientas (martillo, llave, taladro, desarmador, barreta), los pasos y demás sonidos de su personaje. Se usan los sonidos del propio juego, así que respetan tu volumen. El motor de los vehículos que maneja otro ya sonaba según sus revoluciones.
 - **Tutorial y misiones**: todos van en el mismo paso.
 - **Unirse a mitad de partida**: lo que pase mientras el mundo se envía y se carga se pone al día al terminar la carga. Por ejemplo, máquinas movidas, compras, excavaciones e interruptores.
 

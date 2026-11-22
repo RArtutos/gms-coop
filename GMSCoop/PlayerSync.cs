@@ -419,6 +419,10 @@ namespace GMSCoop
         }
 
         /// <summary>A player left (host broadcast, keyed by the LocalId used in pose packets): drop its avatar now.</summary>
+        /// <summary>The visible avatar of a remote player (feet pivot, facing its yaw), or null.</summary>
+        internal static Transform AvatarRoot(ulong localId) =>
+            Ghosts.TryGetValue(localId, out Ghost g) && g.Avatar.Alive && g.Avatar.Root.activeInHierarchy ? g.Avatar.Root.transform : null;
+
         internal static void RemovePlayer(ulong localId)
         {
             if (!Ghosts.TryGetValue(localId, out Ghost g)) return;

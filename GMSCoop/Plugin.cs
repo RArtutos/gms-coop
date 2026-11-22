@@ -11,7 +11,7 @@ namespace GMSCoop
     public class Plugin : BaseUnityPlugin
     {
         public const string Guid = "gmscoop.multiplayer";
-        public const string Version = "0.14.0";
+        public const string Version = "0.14.1";
 
         internal static ManualLogSource Log;
         internal static Plugin Instance;
@@ -88,6 +88,8 @@ namespace GMSCoop
             FocusInput.Tick();
             CoopUi.Tick(); // co-op saves/backups, host-lost prompt, kick list (Ctrl+F6), newer-world offer
             try { Social.Tick(); } catch (Exception ex) { Log.LogWarning("Markers/report: " + ex.Message); }
+            try { RemoteSounds.Tick(); } catch (Exception ex) { Log.LogWarning("Remote sounds: " + ex.Message); }
+            try { DogSync.Tick(); } catch (Exception ex) { Log.LogWarning("Dog sync: " + ex.Message); }
 
             // Ctrl+F12, not F12 alone: F12 is Steam's screenshot key, and each dump adds a large block to the log.
             if (Input.GetKeyDown(KeyCode.F12) && (Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl)))

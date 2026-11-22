@@ -270,6 +270,14 @@ namespace GMSCoop
                 case SubLogChunk:
                     if (Net.IsHost) ReceiveLogChunk(from, r);
                     return;
+                case RemoteSounds.SubPlay:
+                case RemoteSounds.SubStop:
+                case RemoteSounds.SubParam:
+                    RemoteSounds.Receive(sub, from, r, raw);
+                    return;
+                case DogSync.SubDog:
+                    DogSync.Receive(from, r, raw);
+                    return;
             }
         }
 

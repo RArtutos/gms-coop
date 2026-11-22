@@ -166,6 +166,10 @@ namespace GMSCoopInstaller
                 BorderThickness = new Thickness(0),
                 Padding = new Thickness(14, 12, 14, 12),
                 VerticalContentAlignment = VerticalAlignment.Center,
+                // Long codes (CF-word-word-word-word) wrap to a second line instead of hiding off the right edge.
+                TextWrapping = TextWrapping.Wrap,
+                AcceptsReturn = false,
+                MaxLines = 3,
             };
             tb.Tag = placeholder;
             return tb;
