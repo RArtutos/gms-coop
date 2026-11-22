@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="360" viewBox="0 0 1280 360">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1b1510"/>
+      <stop offset="0.65" stop-color="#3a2a17"/>
+      <stop offset="1" stop-color="#5a3d1c"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffe08a"/>
+      <stop offset="0.45" stop-color="#f2b63d"/>
+      <stop offset="1" stop-color="#b9821e"/>
+    </linearGradient>
+    <radialGradient id="sun" cx="0.78" cy="0.42" r="0.35">
+      <stop offset="0" stop-color="#f2b63d" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#f2b63d" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="glow" x="-20%" y="-40%" width="140%" height="180%">
+      <feGaussianBlur stdDeviation="6" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="1280" height="360" fill="url(#sky)"/>
+  <rect width="1280" height="360" fill="url(#sun)"/>
+  <!-- far mountains -->
+  <path d="M0 250 L120 170 L210 215 L330 130 L450 205 L560 150 L690 225 L820 140 L930 200 L1050 120 L1170 190 L1280 150 L1280 360 L0 360 Z" fill="#2a1f14" opacity="0.9"/>
+  <!-- near hills -->
+  <path d="M0 300 L160 245 L300 285 L470 230 L640 290 L800 240 L980 295 L1130 250 L1280 285 L1280 360 L0 360 Z" fill="#1a130c"/>
+  <!-- gold nuggets -->
+  <g fill="url(#gold)" filter="url(#glow)">
+    <path d="M1010 300 l14 -10 l18 4 l6 14 l-12 10 l-20 -2 z"/>
+    <path d="M1062 312 l10 -7 l13 3 l4 10 l-9 7 l-14 -1 z"/>
+    <path d="M965 318 l8 -6 l10 2 l3 8 l-7 6 l-11 -1 z"/>
+  </g>
+  <!-- pickaxe -->
+  <g transform="translate(1090 95) rotate(25)">
+    <rect x="-6" y="0" width="12" height="150" rx="5" fill="#8a5a2b"/>
+    <path d="M-80 -6 Q0 -40 80 -6 L70 6 Q0 -20 -70 6 Z" fill="#c9ccd1"/>
+  </g>
+  <!-- title -->
+  <text x="80" y="170" font-family="Bahnschrift, 'Segoe UI', Arial, sans-serif" font-weight="700" font-size="104" fill="url(#gold)" filter="url(#glow)">GMS Co-op</text>
+  <text x="84" y="222" font-family="'Segoe UI', Arial, sans-serif" font-size="30" fill="#f3ede2">Multijugador cooperativo para Gold Mining Simulator</text>
+  <text x="84" y="262" font-family="'Segoe UI', Arial, sans-serif" font-size="22" fill="#a89a86">Mismo mundo · tiempo real · sin abrir puertos</text>
+</svg>
