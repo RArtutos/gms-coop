@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
@@ -293,6 +294,20 @@ namespace GMSCoopInstaller
         /// <summary>Window icon drawn from the pickaxe path (no icon file in the exe).</summary>
         internal static ImageSource AppIcon()
         {
+            // The exe's own icon (icon.ico, also the ApplicationIcon): a BitmapFrame shows in the taskbar,
+            // a vector DrawingImage does not.
+            try
+            {
+                using (var s = typeof(Ui).Assembly.GetManifestResourceStream("icon.ico"))
+                    if (s != null)
+                    {
+                        var dec = new IconBitmapDecoder(s, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
+                        BitmapFrame best = dec.Frames.OrderByDescending(f => f.PixelWidth).First();
+                        best.Freeze();
+                        return best;
+                    }
+            }
+            catch { }
             var g = new DrawingGroup();
             g.Children.Add(new GeometryDrawing(new SolidColorBrush(BgColor), null, new RectangleGeometry(new Rect(0, 0, 24, 24), 5, 5)));
             g.Children.Add(new GeometryDrawing(Gold, null, Geometry.Parse(IconPick)));

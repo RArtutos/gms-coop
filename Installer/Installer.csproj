@@ -8,6 +8,7 @@
     Steam cache at runtime.
   -->
   <PropertyGroup>
+    <ApplicationIcon>icon.ico</ApplicationIcon>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net48</TargetFramework>
     <UseWPF>true</UseWPF>
@@ -28,6 +29,7 @@
     <Reference Include="System.IO.Compression.FileSystem" />
     <Reference Include="System.Net.Http" />
     <EmbeddedResource Include="payload.zip" LogicalName="payload.zip" />
+    <EmbeddedResource Include="icon.ico" LogicalName="icon.ico" />
     <EmbeddedResource Include="thumbs\*.png" LogicalName="thumbs.%(Filename).png" />
   </ItemGroup>
 
