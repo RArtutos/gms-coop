@@ -81,9 +81,12 @@ namespace GMSCoopInstaller
             Title = "GMS Co-op";
             Icon = Ui.AppIcon();
             Width = 1000;
-            Height = 770;
+            // Fit small screens / high display scaling: never taller than the work area. The home cards
+            // adapt (fewer save rows), so a shorter window still shows everything important.
+            Height = Math.Max(600, Math.Min(770, SystemParameters.WorkArea.Height - 16));
             MinWidth = 1000;
-            MinHeight = 770;
+            MinHeight = Height;
+            if (Environment.GetEnvironmentVariable("GMSCOOP_PREVIEW_HEIGHT") is string ph && double.TryParse(ph, out double phv)) { Height = phv; MinHeight = phv; }
             WindowStyle = WindowStyle.None;
             AllowsTransparency = true;
             Background = Brushes.Transparent;
@@ -138,6 +141,9 @@ namespace GMSCoopInstaller
             foreach (object c in LogicalTreeHelper.GetChildren(d)) ClearFades(c as DependencyObject);
         }
 
+        /// <summary>The banner gets shorter on short windows (small screens / high scaling), down to 170 px.</summary>
+        private double HeroHeight => Math.Max(170, Math.Min(230, Height - 540));
+
         private static string SafeFindGame()
         {
             try { return GameInstall.FindGame(); } catch { return null; }
@@ -159,7 +165,7 @@ namespace GMSCoopInstaller
                 Effect = new DropShadowEffect { BlurRadius = 24, ShadowDepth = 0, Opacity = 0.7 },
             };
             var grid = new Grid { ClipToBounds = true };
-            grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(230) });
+            grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(HeroHeight) });
             grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
             grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(46) });
             root.Child = new Border { CornerRadius = new CornerRadius(18), ClipToBounds = true, Child = grid };
@@ -198,10 +204,10 @@ namespace GMSCoopInstaller
             });
 
             // Title: the game's logo from the Steam cache, else text.
-            var title = new StackPanel { Margin = new Thickness(30, 30, 0, 0), HorizontalAlignment = HorizontalAlignment.Left, VerticalAlignment = VerticalAlignment.Top };
+            var title = new StackPanel { Margin = new Thickness(30, HeroHeight >= 220 ? 30 : 14, 0, 0), HorizontalAlignment = HorizontalAlignment.Left, VerticalAlignment = VerticalAlignment.Top };
             BitmapImage logo = Ui.LoadImage(SteamArt.Logo, 520);
             if (logo != null)
-                title.Children.Add(new Image { Source = logo, Height = 92, HorizontalAlignment = HorizontalAlignment.Left, Stretch = Stretch.Uniform,
+                title.Children.Add(new Image { Source = logo, Height = HeroHeight >= 220 ? 92 : 64, HorizontalAlignment = HorizontalAlignment.Left, Stretch = Stretch.Uniform,
                                                Effect = new DropShadowEffect { BlurRadius = 16, ShadowDepth = 2, Opacity = 0.8 } });
             else
                 title.Children.Add(new TextBlock { Text = "GOLD MINING SIMULATOR", FontFamily = Ui.Heading, FontSize = 34, Foreground = Ui.Text,
@@ -352,39 +358,52 @@ namespace GMSCoopInstaller
             g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
             // ----- Create card: pick a recent save + how friends connect, then one click -----
-            var create = new StackPanel();
-            create.Children.Add(CardHead(Ui.IconPick, "Crear partida"));
-            create.Children.Add(new TextBlock { Text = "Elige la partida y cómo entran tus amigos.", Foreground = Ui.Muted, FontSize = 14, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 6, 0, 10) });
+            // A grid sized by the window: the save list takes the space that is left and simply shows
+            // fewer rows when it does not fit (FitStackPanel), so nothing is cut and no scroll bar appears.
+            var create = new Grid();
+            for (int r = 0; r < 7; r++)
+                create.RowDefinitions.Add(new RowDefinition { Height = r == 2 ? new GridLength(1, GridUnitType.Star) : GridLength.Auto });
+            void AddRow(UIElement e, int row) { Grid.SetRow(e, row); create.Children.Add(e); }
+            AddRow(CardHead(Ui.IconPick, "Crear partida"), 0);
+            AddRow(new TextBlock { Text = "Elige la partida y cómo entran tus amigos.", Foreground = Ui.Muted, FontSize = 14, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 6, 0, 10) }, 1);
 
             _homeHasCode = _inviteCode != null;
             var slots = SaveSlots.List().OrderByDescending(x => x.When).ToList();
             if (_slot != null && !slots.Any(x => x.Name == _slot)) _slot = null;
             _homeSlotRows.Clear();
-            var slotList = new StackPanel();
-            foreach (SaveSlot sl in slots.Take(2)) slotList.Children.Add(SlotRow(sl.Name, sl));
-            if (_slot != null && !slots.Take(2).Any(x => x.Name == _slot))
-                slotList.Children.Insert(0, SlotRow(_slot, slots.First(x => x.Name == _slot)));
-            slotList.Children.Add(SlotRow(null, null));
-            if (!_homeHasCode) create.Children.Add(slotList);
-            else create.Children.Add(new TextBlock { Text = "Partida en curso: " + (_slot ?? "elegida en el juego") + "  ·  " + ModeName(_mode), Foreground = Ui.Text, FontSize = 13.5, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 4) });
-            RefreshSlotRows();
-            if (slots.Count > 2 && !_homeHasCode)
-                create.Children.Add(LinkText("Ver todas mis partidas (" + slots.Count + ")", () => Show("create")));
+            if (!_homeHasCode)
+            {
+                // The selected choice first (never hidden), then the most recent saves, then "choose in game".
+                var slotList = new FitStackPanel();
+                SaveSlot selected = _slot != null ? slots.First(x => x.Name == _slot) : null;
+                slotList.Children.Add(SlotRow(_slot, selected));
+                foreach (SaveSlot sl in slots.Where(x => x.Name != _slot).Take(4)) slotList.Children.Add(SlotRow(sl.Name, sl));
+                if (_slot != null) slotList.Children.Add(SlotRow(null, null));
+                AddRow(slotList, 2);
+                RefreshSlotRows();
+                if (slots.Count > 1)
+                    AddRow(LinkText("Ver todas mis partidas (" + slots.Count + ")", () => Show("create")), 3);
 
-            var chips = new UniformGrid { Columns = 3, Margin = new Thickness(0, 10, 0, 12) };
-            _modeChips.Clear();
-            chips.Children.Add(ModeChip(HostMode.Steam, Ui.IconSteam, "Steam"));
-            chips.Children.Add(ModeChip(HostMode.Cloudflare, Ui.IconCloud, "Cloudflare"));
-            chips.Children.Add(ModeChip(HostMode.Lan, Ui.IconWifi, "Red local"));
-            if (!_homeHasCode) create.Children.Add(chips);
-            RefreshModeChips();
+                var chips = new UniformGrid { Columns = 3, Margin = new Thickness(0, 10, 0, 12) };
+                _modeChips.Clear();
+                chips.Children.Add(ModeChip(HostMode.Steam, Ui.IconSteam, "Steam"));
+                chips.Children.Add(ModeChip(HostMode.Cloudflare, Ui.IconCloud, "Cloudflare"));
+                chips.Children.Add(ModeChip(HostMode.Lan, Ui.IconWifi, "Red local"));
+                AddRow(chips, 4);
+                RefreshModeChips();
+            }
+            else
+            {
+                AddRow(new TextBlock { Text = "Partida en curso: " + (_slot ?? "elegida en el juego") + "  ·  " + ModeName(_mode), Foreground = Ui.Text, FontSize = 13.5, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 10), VerticalAlignment = VerticalAlignment.Top }, 2);
+            }
 
-            create.Children.Add(Ui.Button("Crear partida", Ui.IconPlay, Ui.GoldColor, Host, 54, 18));
-            _invitePanel = new Border { Margin = new Thickness(0, 12, 0, 0) };
-            create.Children.Add(_invitePanel);
-            create.Children.Add(CoopNote("El avance de todos se guarda en la partida del host. Durante la partida: F7 sale, Ctrl+F6 saca a un jugador."));
+            var createBtn = Ui.Button("Crear partida", Ui.IconPlay, Ui.GoldColor, Host, 54, 18);
+            createBtn.ToolTip = "El avance de todos se guarda en la partida del host. Durante la partida: F7 sale, Ctrl+F6 saca a un jugador.";
+            AddRow(createBtn, 5);
+            _invitePanel = new Border { Margin = new Thickness(0, 10, 0, 0) };
+            AddRow(_invitePanel, 6);
             UpdateInvitePanel();
-            g.Children.Add(Ui.CardBox(new ScrollViewer { Content = create, VerticalScrollBarVisibility = ScrollBarVisibility.Hidden }, 22));
+            g.Children.Add(Ui.CardBox(create, 22));
 
             // ----- Join card: code box with paste, and the games found on the network -----
             var join = new StackPanel();
@@ -599,7 +618,9 @@ namespace GMSCoopInstaller
             page.Children.Add(bottom);
             UpdateInvitePanel();
 
-            return new ScrollViewer { Content = page, VerticalScrollBarVisibility = ScrollBarVisibility.Hidden };
+            // Short windows: the whole page shrinks uniformly to fit (no scroll bar, nothing cut).
+            page.Width = 944;
+            return new Viewbox { Child = page, Stretch = Stretch.Uniform, StretchDirection = StretchDirection.DownOnly, VerticalAlignment = VerticalAlignment.Top, HorizontalAlignment = HorizontalAlignment.Left };
         }
 
         private static TextBlock Section(string text) =>

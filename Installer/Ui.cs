@@ -320,4 +320,39 @@ namespace GMSCoopInstaller
             return img;
         }
     }
+
+    /// <summary>
+    /// Vertical stack that shows only the children that fit in its height (in order); the rest are
+    /// laid out with zero size. Lists shrink with the window instead of being cut or scrolled.
+    /// </summary>
+    internal sealed class FitStackPanel : Panel
+    {
+        public FitStackPanel() { ClipToBounds = true; }
+
+        protected override Size MeasureOverride(Size available)
+        {
+            double y = 0, w = 0;
+            foreach (UIElement c in InternalChildren)
+            {
+                c.Measure(new Size(available.Width, double.PositiveInfinity));
+                if (y + c.DesiredSize.Height > available.Height + 0.5) break;
+                y += c.DesiredSize.Height;
+                w = Math.Max(w, c.DesiredSize.Width);
+            }
+            return new Size(double.IsInfinity(available.Width) ? w : available.Width, y);
+        }
+
+        protected override Size ArrangeOverride(Size final)
+        {
+            double y = 0;
+            bool full = false;
+            foreach (UIElement c in InternalChildren)
+            {
+                double h = c.DesiredSize.Height;
+                if (!full && y + h <= final.Height + 0.5) { c.Arrange(new Rect(0, y, final.Width, h)); y += h; }
+                else { full = true; c.Arrange(new Rect(0, final.Height + 10000, final.Width, h)); } // off the clipped area
+            }
+            return final;
+        }
+    }
 }
