@@ -68,8 +68,11 @@ namespace GMSCoopInstaller
                 {
                     string url = m.Groups[1].Value;
                     string name = Uri.UnescapeDataString(url.Substring(url.LastIndexOf('/') + 1));
-                    if (name.Equals(ExeAsset, StringComparison.OrdinalIgnoreCase)) exe = url;
-                    else if (name.Equals(ExeAsset + ".sha256", StringComparison.OrdinalIgnoreCase)) sha = url;
+                    // GitHub stores asset names with spaces as dots ("GMS.Co-op.exe"): accept both spellings.
+                    string norm = name.Replace(' ', '.');
+                    string exeNorm = ExeAsset.Replace(' ', '.');
+                    if (norm.Equals(exeNorm, StringComparison.OrdinalIgnoreCase)) exe = url;
+                    else if (norm.Equals(exeNorm + ".sha256", StringComparison.OrdinalIgnoreCase)) sha = url;
                 }
                 if (exe == null || sha == null) return null; // never install an unverified file
                 return new Release { Version = v, Tag = "v" + v, ExeUrl = exe, ShaUrl = sha };

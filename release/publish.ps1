@@ -19,7 +19,7 @@ $tag = "v$version"
 
 # The launcher in release\out must be the same version as the mod (make_release stamps it).
 $fileVersion = (Get-Item $exe).VersionInfo.FileVersion
-if (-not $fileVersion.StartsWith($version)) { throw "release\out\GMS Co-op.exe is $fileVersion, the mod is $version: run make_release.ps1 again" }
+if (-not $fileVersion.StartsWith($version)) { throw "release\out\GMS Co-op.exe is $fileVersion, the mod is ${version}: run make_release.ps1 again" }
 
 # Hash file: the launcher refuses an update whose download does not match it.
 $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
