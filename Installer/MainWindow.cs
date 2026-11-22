@@ -113,14 +113,15 @@ namespace GMSCoopInstaller
 
         internal void RenderTo(string file, string view)
         {
+            // "home-code" / "create-code": the same view with a sample invite code (design check).
+            if (view.EndsWith("-code")) { _inviteCode = "CF-leaves-looked-instructions-gentle"; _mode = HostMode.Cloudflare; view = view.Substring(0, view.Length - 5); }
             Show(view);
             var root = (FrameworkElement)Content;
             root.Measure(new Size(Width, Height));
             root.Arrange(new Rect(0, 0, Width, Height));
             root.UpdateLayout();
             // Skip the fade-in: render the final state.
-            foreach (var fe in new[] { _content.Content as UIElement })
-                if (fe != null) { fe.BeginAnimation(UIElement.OpacityProperty, null); fe.Opacity = 1; fe.RenderTransform = null; }
+            ClearFades(_content.Content as DependencyObject);
             root.UpdateLayout();
             var bmp = new RenderTargetBitmap((int)Width, (int)Height, 96, 96, PixelFormats.Pbgra32);
             bmp.Render(new Border { Background = new SolidColorBrush(Color.FromRgb(40, 40, 40)) });
@@ -128,6 +129,13 @@ namespace GMSCoopInstaller
             var enc = new PngBitmapEncoder();
             enc.Frames.Add(BitmapFrame.Create(bmp));
             using (var f = File.Create(file)) enc.Save(f);
+        }
+
+        private static void ClearFades(DependencyObject d)
+        {
+            if (d == null) return;
+            if (d is UIElement fe) { fe.BeginAnimation(UIElement.OpacityProperty, null); fe.Opacity = 1; if (fe.RenderTransform is TranslateTransform) fe.RenderTransform = null; }
+            foreach (object c in LogicalTreeHelper.GetChildren(d)) ClearFades(c as DependencyObject);
         }
 
         private static string SafeFindGame()
@@ -348,6 +356,7 @@ namespace GMSCoopInstaller
             create.Children.Add(CardHead(Ui.IconPick, "Crear partida"));
             create.Children.Add(new TextBlock { Text = "Elige la partida y cómo entran tus amigos.", Foreground = Ui.Muted, FontSize = 14, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 6, 0, 10) });
 
+            _homeHasCode = _inviteCode != null;
             var slots = SaveSlots.List().OrderByDescending(x => x.When).ToList();
             if (_slot != null && !slots.Any(x => x.Name == _slot)) _slot = null;
             _homeSlotRows.Clear();
@@ -356,9 +365,10 @@ namespace GMSCoopInstaller
             if (_slot != null && !slots.Take(2).Any(x => x.Name == _slot))
                 slotList.Children.Insert(0, SlotRow(_slot, slots.First(x => x.Name == _slot)));
             slotList.Children.Add(SlotRow(null, null));
-            create.Children.Add(slotList);
+            if (!_homeHasCode) create.Children.Add(slotList);
+            else create.Children.Add(new TextBlock { Text = "Partida en curso: " + (_slot ?? "elegida en el juego") + "  ·  " + ModeName(_mode), Foreground = Ui.Text, FontSize = 13.5, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 4) });
             RefreshSlotRows();
-            if (slots.Count > 2)
+            if (slots.Count > 2 && !_homeHasCode)
                 create.Children.Add(LinkText("Ver todas mis partidas (" + slots.Count + ")", () => Show("create")));
 
             var chips = new UniformGrid { Columns = 3, Margin = new Thickness(0, 10, 0, 12) };
@@ -366,7 +376,7 @@ namespace GMSCoopInstaller
             chips.Children.Add(ModeChip(HostMode.Steam, Ui.IconSteam, "Steam"));
             chips.Children.Add(ModeChip(HostMode.Cloudflare, Ui.IconCloud, "Cloudflare"));
             chips.Children.Add(ModeChip(HostMode.Lan, Ui.IconWifi, "Red local"));
-            create.Children.Add(chips);
+            if (!_homeHasCode) create.Children.Add(chips);
             RefreshModeChips();
 
             create.Children.Add(Ui.Button("Crear partida", Ui.IconPlay, Ui.GoldColor, Host, 54, 18));
@@ -577,10 +587,10 @@ namespace GMSCoopInstaller
             page.Children.Add(modes);
             RefreshModeCards();
 
-            var bottom = new Grid { Margin = new Thickness(0, 16, 0, 0) };
+            var bottom = new Grid { Margin = new Thickness(0, 12, 0, 0) };
             bottom.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             bottom.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            var go = Ui.Button("Crear partida", Ui.IconPlay, Ui.GoldColor, Host, 56, 19);
+            var go = Ui.Button("Crear partida", Ui.IconPlay, Ui.GoldColor, Host, 52, 18);
             go.MinWidth = 260;
             bottom.Children.Add(go);
             _invitePanel = new Border { Margin = new Thickness(18, 0, 0, 0) };
@@ -589,26 +599,26 @@ namespace GMSCoopInstaller
             page.Children.Add(bottom);
             UpdateInvitePanel();
 
-            return new ScrollViewer { Content = page, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
+            return new ScrollViewer { Content = page, VerticalScrollBarVisibility = ScrollBarVisibility.Hidden };
         }
 
         private static TextBlock Section(string text) =>
-            new TextBlock { Text = text, FontFamily = Ui.Heading, FontSize = 17, Foreground = Ui.Gold, Margin = new Thickness(2, 12, 0, 10) };
+            new TextBlock { Text = text, FontFamily = Ui.Heading, FontSize = 17, Foreground = Ui.Gold, Margin = new Thickness(2, 6, 0, 8) };
 
         private Border SlotCard(string name, SaveSlot s)
         {
             var stack = new StackPanel();
-            var thumb = new Border { Width = 176, Height = 99, CornerRadius = new CornerRadius(10), ClipToBounds = true, Background = new SolidColorBrush(Color.FromRgb(0x10, 0x0D, 0x0A)) };
+            var thumb = new Border { Width = 150, Height = 84, CornerRadius = new CornerRadius(10), ClipToBounds = true, Background = new SolidColorBrush(Color.FromRgb(0x10, 0x0D, 0x0A)) };
             BitmapImage img = s != null ? Ui.LoadImage(s.Screenshot, 380) : null;
             if (img != null)
                 thumb.Background = new ImageBrush(img) { Stretch = Stretch.UniformToFill };
             else
                 thumb.Child = Ui.Icon(s == null ? Ui.IconPlay : Ui.IconPick, 34, Ui.Muted);
             stack.Children.Add(thumb);
-            stack.Children.Add(new TextBlock { Text = s == null ? "Elegir en el juego" : s.Name, FontFamily = Ui.Heading, FontSize = 15, Foreground = Ui.Text, Margin = new Thickness(2, 8, 0, 0), TextTrimming = TextTrimming.CharacterEllipsis, MaxWidth = 176 });
+            stack.Children.Add(new TextBlock { Text = s == null ? "Elegir en el juego" : s.Name, FontFamily = Ui.Heading, FontSize = 15, Foreground = Ui.Text, Margin = new Thickness(2, 8, 0, 0), TextTrimming = TextTrimming.CharacterEllipsis, MaxWidth = 150 });
             string info = s == null ? "Cargas o empiezas una partida tú"
                         : s.When.ToString("dd/MM/yyyy HH:mm") + (s.Days != null ? "  ·  día " + s.Days : "") + (s.Cash != null ? "  ·  $" + s.Cash : "");
-            stack.Children.Add(new TextBlock { Text = info, FontSize = 12, Foreground = Ui.Muted, Margin = new Thickness(2, 2, 0, 0), TextTrimming = TextTrimming.CharacterEllipsis, MaxWidth = 176 });
+            stack.Children.Add(new TextBlock { Text = info, FontSize = 12, Foreground = Ui.Muted, Margin = new Thickness(2, 2, 0, 0), TextTrimming = TextTrimming.CharacterEllipsis, MaxWidth = 150 });
             if (s?.CoopLine != null) stack.Children.Add(new TextBlock { Text = s.CoopLine, FontSize = 11.5, Foreground = Ui.Gold, Margin = new Thickness(2, 2, 0, 0), TextTrimming = TextTrimming.CharacterEllipsis, MaxWidth = 176, ToolTip = s.CoopLine });
             var card = new Border { CornerRadius = new CornerRadius(14), Padding = new Thickness(8), Margin = new Thickness(0, 0, 12, 0), BorderThickness = new Thickness(2), Child = stack, Tag = name };
             Ui.Interactive(card, () => { _slot = name; Settings.Set("slot", name ?? ""); RefreshSlotCards(); }, Ui.CardColor, Ui.CardHover);
@@ -630,7 +640,7 @@ namespace GMSCoopInstaller
             head.Children.Add(new TextBlock { Text = title, FontFamily = Ui.Heading, FontSize = 17, Foreground = Ui.Text, Margin = new Thickness(10, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center });
             stack.Children.Add(head);
             stack.Children.Add(new TextBlock { Text = desc, FontSize = 12.5, Foreground = Ui.Muted, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 0) });
-            var card = new Border { CornerRadius = new CornerRadius(14), Padding = new Thickness(16, 14, 16, 14), Margin = new Thickness(0, 0, 12, 0), BorderThickness = new Thickness(2), Child = stack, Tag = mode };
+            var card = new Border { CornerRadius = new CornerRadius(14), Padding = new Thickness(14, 10, 14, 10), Margin = new Thickness(0, 0, 12, 0), BorderThickness = new Thickness(2), Child = stack, Tag = mode };
             Ui.Interactive(card, () => { _mode = mode; Settings.Set("mode", mode.ToString()); RefreshModeCards(); }, Ui.CardColor, Ui.CardHover);
             _modeCards.Add(card);
             return card;
@@ -642,8 +652,12 @@ namespace GMSCoopInstaller
                 c.BorderBrush = (HostMode)c.Tag == _mode ? Ui.Gold : Brushes.Transparent;
         }
 
+        private bool _homeHasCode;
+
         private void UpdateInvitePanel()
         {
+            // Home shows a compact card while a game is running: rebuild it when the code appears or goes.
+            if (_view == "home" && _homeHasCode != (_inviteCode != null)) { Show("home"); return; }
             if (_invitePanel == null) return;
             if (_inviteCode == null)
             {
@@ -656,22 +670,22 @@ namespace GMSCoopInstaller
                 };
                 return;
             }
-            var row = new Grid();
-            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            var left = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
-            left.Children.Add(new TextBlock { Text = "Código para tus amigos (ya está copiado)", Foreground = Ui.Muted, FontSize = 12.5 });
-            left.Children.Add(new TextBox
-            {
-                Text = _inviteCode, IsReadOnly = true, FontFamily = Ui.Mono, FontSize = 22, Foreground = Ui.Gold,
-                Background = Brushes.Transparent, BorderThickness = new Thickness(0), Padding = new Thickness(0, 2, 0, 0),
-            });
-            row.Children.Add(left);
-            var copy = Ui.Button("Copiar", Ui.IconCopy, Color.FromRgb(0x3A, 0x30, 0x22), () => { CopyCode(); Status("Código copiado: pégalo en el chat con tus amigos."); }, 44, 15);
+            // Vertical so it fits any card width: the code shrinks to fit (never a scroll bar or a cut).
+            var stack = new StackPanel();
+            var head = new Grid();
+            head.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            head.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            head.Children.Add(new TextBlock { Text = "Código para tus amigos (ya está copiado)", Foreground = Ui.Muted, FontSize = 12.5, TextWrapping = TextWrapping.Wrap, VerticalAlignment = VerticalAlignment.Center });
+            var copy = Ui.Button("Copiar", Ui.IconCopy, Color.FromRgb(0x3A, 0x30, 0x22), () => { CopyCode(); Status("Código copiado: pégalo en el chat con tus amigos."); }, 36, 13.5);
+            copy.Margin = new Thickness(8, 0, 0, 0);
             Grid.SetColumn(copy, 1);
-            row.Children.Add(copy);
-            var box = Ui.CardBox(row, 12);
+            head.Children.Add(copy);
+            stack.Children.Add(head);
+            var code = new TextBlock { Text = _inviteCode, FontFamily = Ui.Mono, FontSize = 24, Foreground = Ui.Gold, Margin = new Thickness(0, 8, 0, 0) };
+            stack.Children.Add(new Viewbox { Child = code, Stretch = Stretch.Uniform, StretchDirection = StretchDirection.DownOnly, HorizontalAlignment = HorizontalAlignment.Left });
+            var box = Ui.CardBox(stack, 12);
             box.BorderBrush = Ui.Gold;
+            box.ToolTip = _inviteCode;
             _invitePanel.Child = box;
             Ui.FadeIn(box);
         }
