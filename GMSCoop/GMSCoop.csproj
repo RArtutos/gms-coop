@@ -1,0 +1,51 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <AssemblyName>GMSCoop</AssemblyName>
+    <LangVersion>latest</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <!-- Folder with the game's managed DLLs (code-only download or full install). -->
+    <GameManaged Condition="'$(GameManaged)' == ''">..\gms\GoldMiningSimulator_Data\Managed</GameManaged>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <GameDir Condition="'$(GameDir)' == ''">E:\SteamLibrary\steamapps\common\Gold Rush The Game</GameDir>
+  </PropertyGroup>
+
+  <!-- Copy the built mod into the game's BepInEx plugins folder. -->
+  <Target Name="DeployToGame" AfterTargets="Build" Condition="Exists('$(GameDir)\BepInEx\plugins')">
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(GameDir)\BepInEx\plugins" />
+  </Target>
+
+  <ItemGroup>
+    <EmbeddedResource Include="lang\es_extra.csv" LogicalName="GMSCoop.es_extra.csv" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    <PackageReference Include="BepInEx.Core" Version="5.4.21" PrivateAssets="all" />
+    <PackageReference Include="HarmonyX" Version="2.10.2" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="$(GameManaged)\Assembly-CSharp.dll" Private="false" />
+    <Reference Include="$(GameManaged)\Assembly-CSharp-firstpass.dll" Private="false" />
+    <Reference Include="$(GameManaged)\UnityEngine.dll" Private="false" />
+    <Reference Include="$(GameManaged)\Rewired_Core.dll" Private="false" />
+    <Reference Include="$(GameManaged)\UnityEngine.CoreModule.dll" Private="false" />
+    <Reference Include="$(GameManaged)\UnityEngine.PhysicsModule.dll" Private="false" />
+    <Reference Include="$(GameManaged)\UnityEngine.TerrainModule.dll" Private="false" />
+    <Reference Include="$(GameManaged)\UnityEngine.IMGUIModule.dll" Private="false" />
+    <Reference Include="$(GameManaged)\UnityEngine.UI.dll" Private="false" />
+    <Reference Include="$(GameManaged)\UnityEngine.AnimationModule.dll" Private="false" />
+    <Reference Include="$(GameManaged)\UnityEngine.ImageConversionModule.dll" Private="false" />
+    <Reference Include="$(GameManaged)\Newtonsoft.Json.dll" Private="false" />
+    <Reference Include="$(GameManaged)\UnityEngine.AudioModule.dll" Private="false" />
+    <Reference Include="$(GameManaged)\UnityEngine.UIModule.dll" Private="false" />
+    <Reference Include="$(GameManaged)\UnityEngine.TextRenderingModule.dll" Private="false" />
+    <Reference Include="$(GameManaged)\UnityEngine.InputLegacyModule.dll" Private="false" />
+  </ItemGroup>
+
+</Project>

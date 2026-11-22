@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    GMS Co-op launcher: installs/updates the mod, creates or joins games (Steam, Cloudflare tunnel,
+    LAN auto-discovery, IP) and starts the game. WPF on .NET Framework 4.8 (built into Windows 10/11),
+    one exe, no extra runtime. The mod files are embedded as one zip resource (payload.zip), produced
+    by make_release.ps1 before building. No game art is embedded: it is read from the player's own
+    Steam cache at runtime.
+  -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>GMS Co-op</AssemblyName>
+    <RootNamespace>GMSCoopInstaller</RootNamespace>
+    <Product>GMS Co-op</Product>
+    <Description>Launcher del mod multijugador GMS Co-op para Gold Mining Simulator</Description>
+    <Version>0.13.0</Version>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <StartupObject>GMSCoopInstaller.Program</StartupObject>
+    <EnableDefaultApplicationDefinition>false</EnableDefaultApplicationDefinition>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    <Reference Include="System.IO.Compression" />
+    <Reference Include="System.IO.Compression.FileSystem" />
+    <Reference Include="System.Net.Http" />
+    <EmbeddedResource Include="payload.zip" LogicalName="payload.zip" />
+    <EmbeddedResource Include="thumbs\*.png" LogicalName="thumbs.%(Filename).png" />
+  </ItemGroup>
+
+</Project>

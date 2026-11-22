@@ -1,0 +1,8 @@
+bin/
+obj/
+release/out/
+release/stage/
+Installer/payload.zip
+tools/
+*.user
+.vs/
