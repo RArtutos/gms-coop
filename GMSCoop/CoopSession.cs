@@ -36,6 +36,7 @@ namespace GMSCoop
     {
         internal const Msg MsgSession = (Msg)19;
         private const byte SubOffer = 1, SubRequest = 2, SubChunk = 3, SubFailed = 4, SubIdentity = 5;
+        internal const byte SubSettings = 6;
         private const int ChunkSize = 64 * 1024;
         private const int MaxQueued = 512 * 1024;
         private const int MaxBytes = 512 * 1024 * 1024;
@@ -274,6 +275,7 @@ namespace GMSCoop
                 }
                 else if (sub == SubRequest) StartUpload(from, r.ReadString());
                 else if (sub == SubIdentity) OnIdentity(r);
+                else if (sub == SubSettings) SessionLifecycle.OnHostSettings(r);
             }
             catch (Exception ex) { Plugin.Log.LogWarning("Session message " + sub + ": " + ex.Message); }
         }
@@ -440,7 +442,7 @@ namespace GMSCoop
               .Append(").  [U] Usar la suya   [N] Seguir con la mía  (el juego espera tu elección)</color>");
         }
 
-        private static MemoryStream Begin(byte sub, out BinaryWriter w)
+        internal static MemoryStream Begin(byte sub, out BinaryWriter w)
         {
             var ms = Net.Writer(MsgSession);
             w = new BinaryWriter(ms);

@@ -843,6 +843,14 @@ namespace GMSCoopInstaller
             low.Checked += (s, e) => Settings.Set("lowgfx", "1");
             low.Unchecked += (s, e) => Settings.Set("lowgfx", "0");
             page.Children.Add(low);
+            var promo = new CheckBox
+            {
+                Content = new TextBlock { Text = "Promoción de un dólar: todo en la tienda cuesta 1 $ (opción del juego; en co-op cuenta la del host)", Foreground = Ui.Text, FontSize = 13.5, TextWrapping = TextWrapping.Wrap },
+                IsChecked = OneDollarOn(), VerticalContentAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 10, 0, 0),
+            };
+            promo.Checked += (s, e) => Settings.Set("onedollar", "1");
+            promo.Unchecked += (s, e) => Settings.Set("onedollar", "0");
+            page.Children.Add(promo);
 
             page.Children.Add(Section("Bueno saber"));
             page.Children.Add(new TextBlock
@@ -856,6 +864,25 @@ namespace GMSCoopInstaller
             page.Children.Add(Section("Créditos"));
             page.Children.Add(CreditsCard()); // MainWindow.Characters.cs
             return new ScrollViewer { Content = page, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
+        }
+
+        /// <summary>The launcher's choice if made, else what the game has now (SettingsData.sav).</summary>
+        private static bool OneDollarOn()
+        {
+            string pref = Settings.Get("onedollar");
+            if (pref == "1" || pref == "0") return pref == "1";
+            try
+            {
+                string f = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                    "AppData", "LocalLow", "CodeHorizon", "GoldMiningSimulator", "Saves", "SettingsData.sav");
+                if (!System.IO.File.Exists(f)) return false;
+                string x = System.IO.File.ReadAllText(f);
+                int i = x.IndexOf("\"OPTIONS_ONE_PROMO\"", StringComparison.Ordinal);
+                if (i < 0) return false;
+                int v = x.IndexOf("<StringValue>", i, StringComparison.Ordinal);
+                return v > 0 && v < i + 120 && x.Substring(v + 13, 1) == "1";
+            }
+            catch { return false; }
         }
 
         private string ModState()
