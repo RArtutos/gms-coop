@@ -11,7 +11,7 @@ namespace GMSCoop
     public class Plugin : BaseUnityPlugin
     {
         public const string Guid = "gmscoop.multiplayer";
-        public const string Version = "0.14.3";
+        public const string Version = "0.14.4";
 
         internal static ManualLogSource Log;
         internal static Plugin Instance;
@@ -86,6 +86,8 @@ namespace GMSCoop
             try { TestProbe.Tick(); } catch (Exception ex) { Log.LogWarning("Test probe: " + ex.Message); }
             try { LanDiscovery.Tick(_lanPort.Value); } catch (Exception ex) { Log.LogWarning("LAN discovery: " + ex.Message); }
             FocusInput.Tick();
+            // Unlocks the local player if another player broke an interaction that blocked input.
+            try { InteractionGuard.Tick(); } catch (Exception ex) { Log.LogWarning("Interaction guard: " + ex.Message); }
             CoopUi.Tick(); // co-op saves/backups, host-lost prompt, kick list (Ctrl+F6), newer-world offer
             try { Social.Tick(); } catch (Exception ex) { Log.LogWarning("Markers/report: " + ex.Message); }
             try { RemoteSounds.Tick(); } catch (Exception ex) { Log.LogWarning("Remote sounds: " + ex.Message); }
