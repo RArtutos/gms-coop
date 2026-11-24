@@ -2219,7 +2219,13 @@ namespace GMSCoop
                 }
                 else SettleInArea(go, pos);
 
-                if (!active && go.activeSelf) go.SetActive(false); // stored (StoreDepotPlace)
+                if (!active && go.activeSelf)
+                {
+                    // Stored (StoreDepotPlace). The local player may be in the middle of getting into it
+                    // (not "controlled" yet): deactivating kills that animation and leaves input blocked.
+                    InteractionGuard.BeforeRemoteRemove(go);
+                    go.SetActive(false);
+                }
                 Plugin.Log.LogInfo($"Machine sync: {go.name} (#{id}) teleported like on the other PC" + (active ? "" : " (stored)"));
             }
             catch (Exception ex)

@@ -251,6 +251,26 @@ namespace GMSCoop
         private static float _syncNext;
         private static int _syncTries;
         private static bool _applyingAttach; // GravityGun.DropObject is blocked while set
+        private static bool _applyingDetach; // same, for a remote detach (Holdable.Detach run for another player)
+
+        /// <summary>Inside the apply of another player's packet (InteractionGuard: no local-only side effects).</summary>
+        internal static bool ApplyingRemote => _applyingRemote;
+
+        /// <summary>
+        /// A holder attach / detach of another player is being applied here. Game code run by it must not
+        /// pick up or drop objects for the LOCAL player (RopeTrommel.Detach picks the drum up, Holdable.Attach
+        /// drops what the player holds, ...).
+        /// </summary>
+        internal static bool ApplyingHolderChange => _applyingAttach || _applyingDetach;
+
+        /// <summary>Holdable.Detach on behalf of another player (see ApplyingHolderChange).</summary>
+        private static void RemoteDetach(Entry e)
+        {
+            bool old = _applyingDetach;
+            _applyingDetach = true;
+            try { e.Hold.Detach(); }
+            finally { _applyingDetach = old; }
+        }
 
         private static bool _indexed;
         private static bool _synced;          // client: keys renamed to the host's (host: always true)
@@ -2086,7 +2106,7 @@ namespace GMSCoop
             }
             else
             {
-                if (e.Attached) e.Hold.Detach();
+                if (e.Attached) RemoteDetach(e);
                 if (!e.Part && !e.Go.activeInHierarchy && e.Go.activeSelf && h.gameObject.activeInHierarchy) e.Go.transform.SetParent(null, true);
                 StopFollow(e, restorePhysics: false);
                 e.Rb.isKinematic = kinematic;
@@ -2136,7 +2156,7 @@ namespace GMSCoop
 
         private static void ApplyDetach(Entry e, bool kinematic, Vector3 pos, Quaternion rot)
         {
-            if (e.Attached) e.Hold.Detach();
+            if (e.Attached) RemoteDetach(e);
             e.SentHolder = null;
             e.AttachEpoch = -1;
             StartFollow(e); // the owner streams the fall and sends the rest pose
@@ -2185,9 +2205,15 @@ namespace GMSCoop
             if (!_indexed && sub == SubSync) TryIndexNow();
             if (!_indexed || !WorldReady()) return;
             if (!Ready && sub != SubSync) return;
+            bool inputWasBlocked = InteractionGuard.InputBlockedNow;
             _applyingRemote = true;
             try { ReceiveKind(sub, r); }
-            finally { _applyingRemote = false; }
+            finally
+            {
+                _applyingRemote = false;
+                // Game code run for another player's action must not lock the local player's input.
+                InteractionGuard.AfterRemoteApply(inputWasBlocked, sub);
+            }
         }
 
         private static void ReceiveKind(byte sub, BinaryReader r)
@@ -2382,7 +2408,7 @@ namespace GMSCoop
                     Holder h = ResolveHolder(it.Holder);
                     if (h != null) { ApplyAttach(e, h, kinematic, it.S.Pos, it.S.Rot, it.Epoch); continue; }
                 }
-                if (e.Attached) e.Hold.Detach();
+                if (e.Attached) RemoteDetach(e);
                 e.SentHolder = null;
                 e.AttachEpoch = -1;
                 StopFollow(e, restorePhysics: false);
@@ -2453,7 +2479,7 @@ namespace GMSCoop
         /// <summary>Takes a remotely touched object out of a holder joint (mirrors GravityGun.PickOutlinedObject).</summary>
         private static void DetachIfAttached(Entry e)
         {
-            if (e.Attached) e.Hold.Detach();
+            if (e.Attached) RemoteDetach(e);
             e.SentHolder = null;
             e.AttachEpoch = -1;
         }
@@ -3062,6 +3088,7 @@ namespace GMSCoop
             GameObject go = e.Go;
             Forget(e);
             if (go == null) return;
+            InteractionGuard.BeforeRemoteRemove(go); // ends a local use of it (panning tub, shovel holder...)
             ForceLocalDrop(go); // drops it if the local player holds it
             UnityEngine.Object.Destroy(go);
         }
@@ -3664,7 +3691,26 @@ namespace GMSCoop
 
             private static MethodBase TargetMethod() => Target;
 
-            private static bool Prefix() => !_applyingAttach;
+            private static bool Prefix() => !ApplyingHolderChange;
+        }
+
+        // Same for GravityGun.PickObject: RopeTrommel.Detach puts the drum in the hands of whoever runs it,
+        // so another player's detach would hand it to the local player (dropping what they hold).
+        [HarmonyPatch]
+        private static class PatchGravityGunPickOnRemoteHolder
+        {
+            private static MethodBase Target => AccessTools.Method(typeof(GravityGun), nameof(GravityGun.PickObject), new[] { typeof(GameObject), typeof(bool) });
+
+            private static bool Prepare()
+            {
+                if (Target != null) return true;
+                Plugin.Log.LogWarning("Object sync: GravityGun.PickObject not found, a remote detach may put an item in the local player's hands");
+                return false;
+            }
+
+            private static MethodBase TargetMethod() => Target;
+
+            private static bool Prefix() => !ApplyingHolderChange;
         }
 
         // =====================================================================================

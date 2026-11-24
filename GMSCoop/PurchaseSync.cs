@@ -712,21 +712,17 @@ namespace GMSCoop
         }
 
         /// <summary>
-        /// The other player sold/returned/reset a machine the local player sits in: get out first,
-        /// otherwise Player keeps a destroyed ControlledMachine and the camera stays in the cab.
+        /// The other player sold/returned/reset a machine the local player sits in (or is getting into /
+        /// out of): get out first, otherwise Player keeps a destroyed ControlledMachine, the camera stays
+        /// in (and is destroyed with) the cab, and an interrupted enter/exit animation leaves input blocked.
+        /// Also ends any other local use of the object (InteractionGuard.BeforeRemoteRemove).
         /// </summary>
         private static void ExitIfLocallyInside(GameObject go)
         {
             if (go == null) return;
-            var mc = go.GetComponentInChildren<MachineController>(true);
-            if (mc == null || !mc.IsControlled()) return;
-            var evc = mc.GetComponentInChildren<EnterVehicleController>(true);
-            try
-            {
-                if (evc != null) evc.ExitMachine(noAnim: true);
-                Plugin.Log.LogInfo("Purchase sync: left " + go.name + " because another player removed it");
-            }
-            catch (Exception ex) { Plugin.Log.LogWarning("Purchase sync: could not exit machine: " + ex.Message); }
+            // EnterVehicleController is a plain class (MachineController.EnterVehicle), not a component:
+            // the old GetComponentInChildren<EnterVehicleController> lookup never found it.
+            InteractionGuard.BeforeRemoteRemove(go);
         }
 
         private static void ReceiveBuyout(BinaryReader r)

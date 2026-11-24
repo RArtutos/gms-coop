@@ -11,7 +11,7 @@ namespace GMSCoop
     public class Plugin : BaseUnityPlugin
     {
         public const string Guid = "gmscoop.multiplayer";
-        public const string Version = "0.14.4";
+        public const string Version = "0.14.5";
 
         internal static ManualLogSource Log;
         internal static Plugin Instance;

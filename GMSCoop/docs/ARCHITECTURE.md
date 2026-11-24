@@ -67,6 +67,7 @@ Wire protocol: **12** (`Net.Protocol`, plugin version 0.13.0, launcher 0.13.0). 
 | Player and world | `GoldSync.cs` (ledger, clock, seasons, workers, statistics) | 14 |
 | Player and world | `ContainerSync.cs`, `DirtSync.cs`, `WorldSync.cs`, `FuelSync.cs` | 14 subs |
 | Player and world | `SessionLifecycle.cs` (game settings snapshot and restore) | none |
+| Player and world | `InteractionGuard.cs` (never leaves the local player locked by an interaction another player broke: shovel holders, separator, machine enter / exit, gold panning, ladders, long input blocks) | none |
 | Player and world | `CashSync.cs` (legacy shim) | 5 |
 
 ## 3. Messages
@@ -356,7 +357,14 @@ Below, a dash in the "Pre / Post" column means the patch has no prefix or no pos
 | ObjectSync | `PatchBucketSlotAttach` | `BucketSlot.Attach` | prefix / finalizer | stack op capture |
 | ObjectSync | `PatchBucketStackDetach` | `BucketStack.Detach` | prefix / finalizer | stack op capture |
 | ObjectSync | `PatchBucketStackCombine` | `BucketStack.Combine` | prefix / finalizer | stack op capture |
-| ObjectSync | `PatchGravityGunDrop` | `GravityGun.DropObject(bool)` | prefix (skip) | no drop during a remote attach |
+| ObjectSync | `PatchGravityGunDrop` | `GravityGun.DropObject(bool)` | prefix (skip) | no drop during a remote attach / detach |
+| ObjectSync | `PatchGravityGunPickOnRemoteHolder` | `GravityGun.PickObject(GameObject, bool)` | prefix (skip) | no pick for the local player during a remote attach / detach (`RopeTrommel.Detach`) |
+| InteractionGuard | `PatchShovelHolder`, `PatchSmallShovelHolder` | `ShovelToolHolder.Unscrewing`, `ShovelSmallToolHolder.Unscrewing` | - / postfix (wrap) | watchdog: a killed shovel use frees input and gives the shovel back |
+| InteractionGuard | `PatchDirtBoxDetach` | `HogPanDirtBox.OnDetach` | prefix / finalizer | the shovel holder stays active while in use |
+| InteractionGuard | `PatchSeparator` | `BucketHolderMagnetiteSeparator.AddContentFromBucket` | - / postfix | watchdog for its input block |
+| InteractionGuard | `PatchVehicleTransition` | `EnterVehicleController.CycleToCameras` / `CycleCamerasOut` / `InterpolateCameraToPath` | - / postfix (wrap) | watchdog: a killed enter / exit animation ends in free walk, input free |
+| InteractionGuard | `PatchRemotePanAttach` | `GoldPan.Attach` | prefix (skip) | a remote pan attach does not start the local panning view |
+| InteractionGuard | `PatchPickRemotePanning` | `GravityGun.PickOutlinedObject` | prefix (skip) | no grabbing the pan / tub another player pans with |
 | ObjectSync | `PatchGravityGunPick` | `GravityGun.PickOutlinedObject` | prefix (skip) | no grabbing what another player holds |
 | ObjectSync | `PatchToolGunPick` | `ToolGun.PickOutlinedObject` | prefix (skip) | same |
 | PassengerSync | `PatchFixedUpdate` | `MachineController.FixedUpdate` | prefix | passenger: `IsDriven` off |
