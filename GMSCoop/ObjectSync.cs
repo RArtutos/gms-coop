@@ -428,7 +428,14 @@ namespace GMSCoop
             go.GetComponent<Player>() == null &&
             go.GetComponent<MachineController>() == null &&
             go.GetComponent<Trailer>() == null &&
-            go.GetComponent<VirtualVolumeDirt>() == null;
+            go.GetComponent<VirtualVolumeDirt>() == null &&
+            // Player tools (hand shovel, small shovel, drill, wrench...) are instantiated by each PC's own
+            // Player (Player.Awake, _myTools): every PC has its own copy, and the saved shovel got the same
+            // key ("Shovel#0") on both. Synced as one object, the other player picking up THEIR shovel took
+            // the local player's shovel out of their hands (lost ownership -> ForceLocalDrop) and left it
+            // following that player, remotely held, so it could not be picked up again (no more shoveling).
+            // The avatar draws the remote player's tool itself (PlayerSync tool type).
+            go.GetComponent<PlayerTool>() == null;
 
         /// <summary>
         /// Keys mean the same object on every PC: indexed, and on a client renamed to the host's keys.
@@ -914,6 +921,7 @@ namespace GMSCoop
             SendPoses();
             if ((_tickCount & 1) == 0) ProximityClaims();
             ScanUnowned();
+            GroundGuardTick(); // objects under the terrain surface go back on it (ObjectSyncGround)
         }
 
         private static GameObject CurrentLocalHeld()
@@ -1277,6 +1285,25 @@ namespace GMSCoop
                     e.Rb.Sleep();
                 }
             }
+        }
+
+        /// <summary>
+        /// BedSync, right before the local driver's bed freezes: a followed object lying on the bed has
+        /// collisions off (StartFollow), so the bed trigger never listed it and the game left it loose on
+        /// the moving truck, where it fell off. Hands it to local physics like ReleaseRested (owner
+        /// unchanged) so it can be frozen with the rest. False if <paramref name="go"/> is not such a follower.
+        /// </summary>
+        internal static bool ReleaseFollowerForBed(GameObject go)
+        {
+            Entry e = EntryOf(go);
+            if (e == null || e.Rb == null || !e.Following || e.HeldBy != 0 || e.Attached || e.Part || e.Owner == Net.LocalId) return false;
+            StopFollow(e, restorePhysics: true);
+            if (!e.Rb.isKinematic)
+            {
+                e.Rb.velocity = Vector3.zero;
+                e.Rb.angularVelocity = Vector3.zero;
+            }
+            return true;
         }
 
         // ---------------------------------------------------------------- ropes (Hook_Rope)
@@ -3410,6 +3437,7 @@ namespace GMSCoop
                     if (idx >= comps.Length || comps[idx] == null) continue;
                     try
                     {
+                        PadResourceBags(comps[idx]);
                         comps[idx].Deserialize(keys);
                         comps[idx].AfterDeserialize();
                     }
@@ -3422,6 +3450,39 @@ namespace GMSCoop
             catch (Exception ex)
             {
                 Plugin.Log.LogWarning("Object sync: bad component data for " + go.name + ": " + ex.Message);
+            }
+        }
+
+        private static readonly FieldInfo BagData = AccessTools.Field(typeof(ResourceBag), "_data");
+        private static readonly Dictionary<Type, FieldInfo[]> BagFields = new Dictionary<Type, FieldInfo[]>();
+        private static readonly int ResourceKinds = Enum.GetValues(typeof(ResourceType)).Length;
+
+        /// <summary>
+        /// A ResourceBag's array is serialized in the prefab: prefabs saved before a resource type was added
+        /// (Diamond) have a shorter one, and Deserialize (Minerals.Add(Diamond, ...)) threw "Index was outside
+        /// the bounds of the array" when another player's created object was set up here (30 times for the
+        /// GroundSphere clods of a hog pan in one session), losing what came after it. Pads such arrays.
+        /// </summary>
+        private static void PadResourceBags(ISerializableComponent comp)
+        {
+            if (BagData == null || comp == null) return;
+            Type t = comp.GetType();
+            if (!BagFields.TryGetValue(t, out FieldInfo[] fields))
+            {
+                var list = new List<FieldInfo>();
+                for (Type c = t; c != null && c != typeof(MonoBehaviour); c = c.BaseType)
+                    foreach (FieldInfo f in c.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly))
+                        if (f.FieldType == typeof(ResourceBag)) list.Add(f);
+                BagFields[t] = fields = list.ToArray();
+            }
+            foreach (FieldInfo f in fields)
+            {
+                if (!(f.GetValue(comp) is ResourceBag bag)) continue;
+                var data = BagData.GetValue(bag) as float[];
+                if (data != null && data.Length >= ResourceKinds) continue;
+                var padded = new float[ResourceKinds];
+                if (data != null) Array.Copy(data, padded, data.Length);
+                BagData.SetValue(bag, padded);
             }
         }
 

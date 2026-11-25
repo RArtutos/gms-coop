@@ -11,7 +11,7 @@ namespace GMSCoop
     public class Plugin : BaseUnityPlugin
     {
         public const string Guid = "gmscoop.multiplayer";
-        public const string Version = "0.14.5";
+        public const string Version = "0.14.6";
 
         internal static ManualLogSource Log;
         internal static Plugin Instance;
@@ -57,6 +57,7 @@ namespace GMSCoop
             _lanHostIp = Config.Bind("LAN", "HostIp", "127.0.0.1", "IP of the LAN host to join with F10.");
             _lanPort = Config.Bind("LAN", "Port", 27777, "TCP port for LAN games.");
             CoopSaves.Init(Config);
+            WorldStreaming.Init(Config, gameObject); // smoother area streaming (local only)
 
             string[] args = Environment.GetCommandLineArgs();
             for (int i = 0; i < args.Length; i++)

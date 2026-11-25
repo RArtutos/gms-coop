@@ -56,6 +56,7 @@ Wire protocol: **12** (`Net.Protocol`, plugin version 0.13.0, launcher 0.13.0). 
 | Area | Files | Message |
 |---|---|---|
 | Objects | `ObjectSync.cs` (loose physics objects, holders, bucket stacks, ropes / hooks / fuel pistols, generic create / destroy) | 12 |
+| Objects | `ObjectSyncGround.cs` (ground guard: keyed objects this PC simulates that are under the terrain surface or falling through it are lifted back, claimed and streamed; loose objects in an unloaded area are parked; around TerrainSync's collider rebuild for a remote height edit, objects the ground rose under are lifted by the rise and those it dropped under are woken) | 12 (poses / claims) |
 | Objects | `PurchaseSync.cs` (shop, vehicles, trailers, lots, laptop tabs, rentals, sales, parcel reset, workers hired) | 10 |
 | Vehicles | `MachineSync.cs` (driving, trailers, teleports, ids) | 6 |
 | Vehicles | `MachinePartsSync.cs` (arms, wheels, engine, fuel / wear, light trailer) | 11 and 6 |

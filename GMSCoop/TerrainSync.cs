@@ -109,6 +109,9 @@ namespace GMSCoop
         private static readonly Dictionary<TerrainData, Info> ByData = new Dictionary<TerrainData, Info>();
         private static readonly Dictionary<long, Info> ByKey = new Dictionary<long, Info>();
         private static readonly HashSet<Info> LodPending = new HashSet<Info>();
+        // World area (x/z and new height range) of the remote height writes since the last SyncHeightmap, per tile:
+        // loose objects there are lifted / woken when the collider changes (ObjectSync.TerrainEditBegin/End).
+        private static readonly Dictionary<Info, Bounds> EditArea = new Dictionary<Info, Bounds>();
         private static float _builtAt = -10f;
         private static float _nextFlush, _nextHousekeeping, _nextPendingRetry;
         private static int _lastTickFrame = -1;
@@ -143,7 +146,31 @@ namespace GMSCoop
                 ByData.Remove(d);
                 if (ByKey.TryGetValue(Key(info.Kx, info.Kz), out Info k) && k == info) ByKey.Remove(Key(info.Kx, info.Kz));
                 LodPending.Remove(info);
+                EditArea.Remove(info);
             }
+        }
+
+        /// <summary>Adds a remote height write (heightmap cells x..x+w, y..y+h, new values) to the tile's edited world area.</summary>
+        private static void AddEditArea(Info info, int x, int y, int w, int h, float[,] arr)
+        {
+            TerrainData d = info.D;
+            Vector3 o = info.T.GetPosition(), size = d.size;
+            int res = d.heightmapResolution;
+            float lo = float.MaxValue, hi = float.MinValue;
+            for (int i = 0; i < h; i++)
+                for (int j = 0; j < w; j++)
+                {
+                    float v = arr[i, j];
+                    if (v < lo) lo = v;
+                    if (v > hi) hi = v;
+                }
+            float sx = size.x / (res - 1), sz = size.z / (res - 1);
+            var min = new Vector3(o.x + x * sx, o.y + lo * size.y, o.z + y * sz);
+            var max = new Vector3(o.x + (x + w - 1) * sx, o.y + hi * size.y, o.z + (y + h - 1) * sz);
+            var b = new Bounds();
+            b.SetMinMax(min, max);
+            if (EditArea.TryGetValue(info, out Bounds old)) b.Encapsulate(old);
+            EditArea[info] = b;
         }
 
         private static Info Get(TerrainData d)
@@ -184,6 +211,7 @@ namespace GMSCoop
             ByData.Clear();
             ByKey.Clear();
             LodPending.Clear();
+            EditArea.Clear();
             Pending.Clear();
             _pendingBytes = 0;
             _builtAt = -10f;
@@ -768,9 +796,17 @@ namespace GMSCoop
                 // Remote heights were written with SetHeightsDelayLOD: rebuild LOD/collision once per frame.
                 if (LodPending.Count > 0)
                 {
+                    // The collider still has the old surface until SyncHeightmap: loose objects in the edited
+                    // area are measured on it first, then lifted by what the ground rose under them (or woken
+                    // where it dropped) before the next physics step. Otherwise another player's dig / dirt
+                    // dump buried resting bodies, which then sank or fell through the terrain on this PC.
+                    foreach (var kv in EditArea)
+                        if (kv.Key.T != null && LodPending.Contains(kv.Key)) ObjectSync.TerrainEditBegin(kv.Value);
+                    EditArea.Clear();
                     foreach (Info info in LodPending)
                         if (info.T != null && info.D != null) info.D.SyncHeightmap(); // = Terrain.ApplyDelayedHeightmapModification (obsolete name)
                     LodPending.Clear();
+                    ObjectSync.TerrainEditEnd();
                 }
                 ReapplyRestored();
                 if (now >= _nextFlush)
@@ -795,6 +831,8 @@ namespace GMSCoop
             catch (Exception ex)
             {
                 LodPending.Clear();
+                EditArea.Clear();
+                ObjectSync.TerrainEditEnd();
                 GTick.Fail(ex);
             }
         }
@@ -1440,6 +1478,7 @@ namespace GMSCoop
                     {
                         d.SetHeightsDelayLOD(x, y, arr);
                         LodPending.Add(info);
+                        AddEditArea(info, x, y, w, h, arr);
                         UpdateShadow(info.H, true, 1, x, y, w, h, mask, arr, null);
                     }
                     if (!_loggedFirstHeights)

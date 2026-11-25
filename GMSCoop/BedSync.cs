@@ -525,6 +525,44 @@ namespace GMSCoop
             finally { _allowUnfreeze = false; }
         }
 
+        private static readonly Collider[] BedHits = new Collider[64];
+        private static int _bedMask = -1;
+
+        /// <summary>
+        /// Local driver's freeze: items another player just put on the bed may still follow that player's
+        /// stream here (kinematic, collisions off until ReleaseRested). The bed trigger (OnTriggerStay) never
+        /// sees such a body, so the game froze the rest and left those loose on the moving truck: they fell
+        /// off on the road, on every PC (this PC streams what its truck carries). Lists them like the trigger
+        /// would (same filter: pickable box collider of a saved object) after handing them to local physics.
+        /// </summary>
+        private static void AddFollowedCargo(TransportBed bed)
+        {
+            if (!bed.VehicleBed || LocalDriverSlot(bed, out _) < 0) return;
+            BoxCollider box = bed.GetComponent<BoxCollider>();
+            if (box == null) return;
+            if (_bedMask == -1) _bedMask = LayerMask.GetMask("Pickable", "PickedObject");
+            Transform t = bed.transform;
+            Vector3 half = Vector3.Scale(box.size * 0.5f, t.lossyScale);
+            half = new Vector3(Mathf.Abs(half.x), Mathf.Abs(half.y), Mathf.Abs(half.z));
+            int n = Physics.OverlapBoxNonAlloc(t.TransformPoint(box.center), half, BedHits, t.rotation, _bedMask, QueryTriggerInteraction.Ignore);
+            int added = 0;
+            for (int i = 0; i < n; i++)
+            {
+                Collider col = BedHits[i];
+                BedHits[i] = null;
+                if (!(col is BoxCollider) || col.attachedRigidbody == null || col.attachedRigidbody.detectCollisions) continue;
+                var sm = col.GetComponentInParent<GoldDiggerS.SaveMe>();
+                if (sm == null || bed.ObjectsOnBedD.Contains(sm)) continue;
+                if (!ObjectSync.ReleaseFollowerForBed(col.attachedRigidbody.gameObject) &&
+                    !ObjectSync.ReleaseFollowerForBed(sm.gameObject)) continue;
+                bed.ObjectsOnBedD.Add(sm);
+                if (sm.GetComponent<SellableObject>() != null && sm.TryGetComponent<CheckCanOperateAndFreeze>(out var c))
+                    c.GroundRadius = 0f;
+                added++;
+            }
+            if (added > 0) Plugin.Log.LogInfo($"Bed sync: {added} item(s) another player just put on {bed.name} added to the cargo");
+        }
+
         private static string Describe(Entry e) => e.Key.Length > 0 ? e.Key : "(" + e.Sid + ", no key)";
 
         /// <summary>
@@ -634,6 +672,11 @@ namespace GMSCoop
             private static bool Prefix(TransportBed __instance, out bool __state)
             {
                 __state = _allowFreeze || !HeldBeds.ContainsKey(__instance);
+                if (__state && !_allowFreeze && Net.Active)
+                {
+                    try { AddFollowedCargo(__instance); }
+                    catch (Exception ex) { VehicleTraffic.Warn("bed followers", "Bed sync: followed cargo not added: " + ex.Message); }
+                }
                 return __state;
             }
 
