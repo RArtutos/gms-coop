@@ -63,6 +63,10 @@ namespace GMSCoopInstaller
         {
             string ours = Path.Combine(game, "BepInEx", "plugins", PluginFile);
             if (!File.Exists(ours) || !File.Exists(Path.Combine(game, "winhttp.dll"))) return false;
+            // A BepInEx we installed must be complete: a first install that stopped halfway is repaired.
+            if (File.Exists(Path.Combine(game, "BepInEx", MarkerFile)))
+                foreach (string rel in PayloadLoaderFiles())
+                    if (!File.Exists(Path.Combine(game, rel.Replace('/', Path.DirectorySeparatorChar)))) return false;
             byte[] payload = PayloadPluginHash();
             if (payload == null) return true; // a launcher without payload cannot do better
             using (var sha = SHA256.Create())
@@ -71,6 +75,26 @@ namespace GMSCoopInstaller
         }
 
         private static byte[] _payloadHash;
+        private static List<string> _loaderFiles;
+
+        /// <summary>The payload's BepInEx files (everything except our plugin folder), as relative paths.</summary>
+        private static List<string> PayloadLoaderFiles()
+        {
+            if (_loaderFiles != null) return _loaderFiles;
+            var list = new List<string>();
+            using (Stream s = Assembly.GetExecutingAssembly().GetManifestResourceStream("payload.zip"))
+            {
+                if (s != null)
+                    using (var zip = new ZipArchive(s, ZipArchiveMode.Read))
+                        foreach (ZipArchiveEntry e in zip.Entries)
+                        {
+                            string name = e.FullName.Replace('\\', '/').TrimStart('/');
+                            if (name.Length == 0 || name.EndsWith("/") || name.StartsWith("BepInEx/plugins/", StringComparison.OrdinalIgnoreCase)) continue;
+                            list.Add(name);
+                        }
+            }
+            return _loaderFiles = list;
+        }
 
         private static byte[] PayloadPluginHash()
         {
@@ -138,6 +162,15 @@ namespace GMSCoopInstaller
                 throw new InvalidOperationException("En la carpeta del juego hay BepInEx 6, y este mod necesita BepInEx 5. Quita BepInEx 6 y vuelve a intentarlo.");
             bool hadBepInEx = File.Exists(Path.Combine(core, "BepInEx.dll"));
             bool hadLoader = File.Exists(Path.Combine(game, "winhttp.dll"));
+            string marker = Path.Combine(bep, MarkerFile);
+            // Our own BepInEx is always rewritten whole, so a first install that stopped halfway gets repaired.
+            bool ourBepInEx = !hadBepInEx || File.Exists(marker);
+            if (ourBepInEx)
+            {
+                Directory.CreateDirectory(bep);
+                File.WriteAllText(marker,
+                    "BepInEx fue instalado por GMS Co-op. Al desinstalar el mod, BepInEx se quita solo si no quedan otros mods." + Environment.NewLine);
+            }
 
             Stream s = Assembly.GetExecutingAssembly().GetManifestResourceStream("payload.zip");
             if (s == null) throw new InvalidOperationException("El launcher está incompleto (falta payload.zip).");
@@ -161,7 +194,7 @@ namespace GMSCoopInstaller
                     bool isPlugin = name.StartsWith("BepInEx/plugins/", StringComparison.OrdinalIgnoreCase);
                     bool isRoot = name.IndexOf('/') < 0;
                     // Keep an existing BepInEx (and its other mods) as it is; only a missing loader is put back.
-                    if (!isPlugin && hadBepInEx && (!isRoot || hadLoader)) continue;
+                    if (!isPlugin && !ourBepInEx && (!isRoot || hadLoader)) continue;
                     string target = Inside(game, name.Replace('/', Path.DirectorySeparatorChar));
                     if (target == null) continue;
                     Directory.CreateDirectory(Path.GetDirectoryName(target));
@@ -171,11 +204,8 @@ namespace GMSCoopInstaller
                 }
             }
             if (!File.Exists(ours)) throw new InvalidOperationException("El launcher está incompleto (falta " + PluginFile + ").");
-            if (!hadBepInEx)
-                File.WriteAllText(Path.Combine(bep, MarkerFile),
-                    "BepInEx fue instalado por GMS Co-op. Al desinstalar el mod, BepInEx se quita solo si no quedan otros mods." + Environment.NewLine);
             EnsureSteamAppId(game);
-            return "Mod " + VersionText + " instalado (" + written + " archivos" + (hadBepInEx ? ", tu BepInEx se queda" : "") + ").";
+            return "Mod " + VersionText + " instalado (" + written + " archivos" + (!ourBepInEx ? ", tu BepInEx se queda" : "") + ").";
         }
 
         internal static string Uninstall(string game)
@@ -186,6 +216,7 @@ namespace GMSCoopInstaller
             bool hadMod = false;
             if (Directory.Exists(plugins))
                 foreach (string f in Directory.GetFiles(plugins, PluginFile, SearchOption.AllDirectories)) { DeleteFile(f); hadMod = true; }
+            DeleteTree(Path.Combine(plugins, "GMSCoop_avatars"));
             DeleteFile(Path.Combine(bep, "config", ConfigFile));
             bool ourBepInEx = File.Exists(Path.Combine(bep, MarkerFile));
             bool otherMods = (Directory.Exists(plugins) && Directory.EnumerateFiles(plugins, "*.dll", SearchOption.AllDirectories).Any()) ||
@@ -195,6 +226,7 @@ namespace GMSCoopInstaller
             {
                 DeleteTree(bep);
                 foreach (string f in RootFiles) DeleteFile(Path.Combine(game, f));
+                DeleteFile(Path.Combine(game, "steam_appid.txt"));
             }
             string head = hadMod ? "Mod quitado." : "El mod no estaba instalado.";
             return removeBepInEx ? (hadMod ? "Mod y BepInEx quitados: el juego quedó como antes." : head + " BepInEx quitado.")

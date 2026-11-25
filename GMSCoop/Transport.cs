@@ -113,9 +113,15 @@ namespace GMSCoop
     /// WebSocket through the launcher's bridge). Frames: [int32 length][payload]. Peer ids: host = 1,
     /// clients = 2, 3, ... Reads and writes run on worker threads; the main thread never blocks on a socket.
     ///
-    /// Lanes: a peer may have up to 4 connections. Lane 0 is the session (its close ends the peer); the host
-    /// sends a token on it (HybridTransport), and the client opens lanes 1-3 to the same address, each starting
-    /// with the frame [0xE5][u64 token][u8 lane]. A lane that fails or closes only falls back to lane 0.
+    /// Lanes: a peer may have up to 4 connections. Lane 0 is the session; the host sends a token on it
+    /// (HybridTransport), and the client opens lanes 1-3 to the same address, each starting with the frame
+    /// [0xE5][u64 token][u8 lane]. A lane that fails or closes only falls back to lane 0.
+    ///
+    /// Lane 0 re-attach: once the token is known, a dropped lane 0 does not end the peer. Both sides keep it
+    /// "detached" (event LaneEvent.Detached), the client reconnects every half second with the same hello and
+    /// lane 0 (the host accepts it even if it has not noticed the old connection died yet), and both sides
+    /// report LaneEvent.Reattached. HybridTransport re-sends what the other side has not acknowledged and
+    /// decides when to give up (Disconnect).
     /// </summary>
     internal sealed class LanTransport : ILaneTransport
     {
@@ -175,6 +181,8 @@ namespace GMSCoop
         private readonly ConcurrentQueue<Packet> _inbox = new ConcurrentQueue<Packet>();
         private readonly Dictionary<ulong, Conn[]> _peers = new Dictionary<ulong, Conn[]>();
         private readonly Dictionary<ulong, ulong> _tokens = new Dictionary<ulong, ulong>(); // token -> peer
+        private readonly HashSet<ulong> _reattaching = new HashSet<ulong>(); // client: peers with a reconnect thread
+        private ulong _clientToken; // client: the host's lane token (0 = none yet: lane 0 cannot re-attach)
         private readonly object _connsLock = new object();
         private TcpListener _listener;
         private volatile bool _closed;
@@ -232,27 +240,102 @@ namespace GMSCoop
             }
         }
 
-        private void Start(Conn conn)
+        /// <summary>Starts the read and write threads; false (connection closed) if a bound one was refused.</summary>
+        private bool Start(Conn conn, bool reattach = false)
         {
             // A peer that stops reading must not block the write thread forever (it closes the socket).
             // As long as the keep-alive limit: a Wi-Fi stall of a few seconds must not end the session.
             conn.Client.SendTimeout = 30000;
-            if (conn.Bound) Bind(conn);
+            if (conn.Bound && !Bind(conn, reattach))
+            {
+                try { conn.Client.Close(); } catch (Exception) { }
+                return false;
+            }
             new Thread(() => ReadLoop(conn)) { IsBackground = true, Name = "GMSCoop-Read" }.Start();
             new Thread(() => WriteLoop(conn)) { IsBackground = true, Name = "GMSCoop-Write" }.Start();
+            return true;
         }
 
-        private void Bind(Conn conn)
+        /// <summary>
+        /// Registers the connection as that lane of its peer. Only a first lane 0 creates a peer: an extra lane
+        /// or a re-attach of a peer that is gone meanwhile is refused (false).
+        /// </summary>
+        private bool Bind(Conn conn, bool reattach = false)
         {
             Conn old;
             lock (_connsLock)
             {
-                if (!_peers.TryGetValue(conn.Peer, out Conn[] lanes)) _peers[conn.Peer] = lanes = new Conn[LaneCount];
+                if (!_peers.TryGetValue(conn.Peer, out Conn[] lanes))
+                {
+                    if (_closed || reattach || conn.Lane != 0) return false;
+                    _peers[conn.Peer] = lanes = new Conn[LaneCount];
+                }
                 old = lanes[conn.Lane];
                 lanes[conn.Lane] = conn;
                 conn.Bound = true;
+                if (reattach) _inbox.Enqueue(new Packet { From = conn.Peer, Data = null, Event = LaneEvent.Reattached });
             }
             if (old != null && old != conn) CloseConn(old);
+            return true;
+        }
+
+        /// <summary>Lane 0 of this peer may come back: the host gave it a token (host), or we have the host's (client).</summary>
+        private bool CanReattachLocked(ulong peer) =>
+            _hostIp == null ? _tokens.ContainsValue(peer) : _clientToken != 0 && peer == HostPeerId;
+
+        private static byte[] LaneHello(ulong token, int lane)
+        {
+            var hello = new byte[10];
+            hello[0] = LaneHelloTag;
+            Buffer.BlockCopy(BitConverter.GetBytes(token), 0, hello, 1, 8);
+            hello[9] = (byte)lane;
+            return hello;
+        }
+
+        /// <summary>Client: reconnects lane 0 to the host until it works, the peer is dropped or the transport closes.</summary>
+        private void StartReattach(ulong peer)
+        {
+            lock (_connsLock) if (_closed || !_reattaching.Add(peer)) return;
+            new Thread(() =>
+            {
+                bool registered = true;
+                try
+                {
+                    while (true)
+                    {
+                        Thread.Sleep(500);
+                        ulong token;
+                        lock (_connsLock)
+                        {
+                            if (_closed || !_peers.TryGetValue(peer, out Conn[] lanes) || lanes[0] != null) return;
+                            token = _clientToken;
+                        }
+                        TcpClient c = null;
+                        try
+                        {
+                            c = new TcpClient { NoDelay = true };
+                            IAsyncResult ar = c.BeginConnect(_hostIp, _hostPort, null, null);
+                            if (!ar.AsyncWaitHandle.WaitOne(5000)) { try { c.Close(); } catch { } continue; }
+                            c.EndConnect(ar);
+                        }
+                        catch (Exception) { try { c?.Close(); } catch { } continue; }
+                        var conn = new Conn { Peer = peer, Lane = 0, Bound = true, Client = c, Stream = c.GetStream() };
+                        conn.Out.Add(Frame(LaneHello(token, 0)), false); // first frame on the wire
+                        // Leave the set first: if this connection drops at once, its ReadLoop starts a new attempt.
+                        lock (_connsLock) _reattaching.Remove(peer);
+                        registered = false;
+                        if (Start(conn, reattach: true))
+                            for (int lane = 1; lane < LaneCount; lane++)
+                                if (!HasLane(peer, lane)) OpenLane(peer, token, lane);
+                        return;
+                    }
+                }
+                catch (Exception) { }
+                finally
+                {
+                    if (registered) lock (_connsLock) _reattaching.Remove(peer);
+                }
+            }) { IsBackground = true, Name = "GMSCoop-Reattach" }.Start();
         }
 
         private void ReadLoop(Conn conn)
@@ -275,15 +358,17 @@ namespace GMSCoop
                             ulong peer;
                             bool known;
                             lock (_connsLock) known = _tokens.TryGetValue(token, out peer) && _peers.ContainsKey(peer);
-                            if (!known || lane < 1 || lane >= LaneCount) throw new IOException("Unknown lane token");
+                            if (!known || lane < 0 || lane >= LaneCount) throw new IOException("Unknown lane token");
                             conn.Peer = peer;
                             conn.Lane = lane;
-                            Bind(conn);
+                            // Lane 0: the client re-attaches its session (it may replace a connection we still
+                            // think is open, a half-open one after a network change).
+                            if (!Bind(conn, reattach: lane == 0)) throw new IOException("Lane of a peer that left");
                             continue;
                         }
                         conn.Peer = (ulong)Interlocked.Increment(ref _nextId) - 1;
                         conn.Lane = 0;
-                        Bind(conn);
+                        if (!Bind(conn)) throw new IOException("Transport closed");
                     }
                     _inbox.Enqueue(new Packet { From = conn.Peer, Data = data, Length = len, Reliable = true, Lane = conn.Lane });
                 }
@@ -299,6 +384,29 @@ namespace GMSCoop
                 lock (_connsLock)
                     if (_peers.TryGetValue(conn.Peer, out Conn[] lanes) && lanes[conn.Lane] == conn) lanes[conn.Lane] = null;
                 CloseConn(conn);
+                return;
+            }
+            bool owner = false, detached = false;
+            lock (_connsLock)
+            {
+                if (_peers.TryGetValue(conn.Peer, out Conn[] lanes) && lanes[0] == conn)
+                {
+                    owner = true;
+                    if (!_closed && CanReattachLocked(conn.Peer))
+                    {
+                        lanes[0] = null;
+                        detached = true;
+                    }
+                }
+            }
+            if (!owner) { CloseConn(conn); return; } // replaced by a re-attached lane 0, or the peer left
+            if (detached)
+            {
+                // Whatever was still queued on it is lost: HybridTransport re-sends it after the re-attach.
+                conn.Out.Complete();
+                try { conn.Client.Close(); } catch (Exception) { }
+                _inbox.Enqueue(new Packet { From = conn.Peer, Data = null, Event = LaneEvent.Detached });
+                if (_hostIp != null) StartReattach(conn.Peer);
                 return;
             }
             bool wasOpen = RemovePeer(conn.Peer, conn);
@@ -364,29 +472,27 @@ namespace GMSCoop
         public void OpenLanes(ulong peer, ulong token)
         {
             if (_hostIp == null) return;
-            for (int lane = 1; lane < LaneCount; lane++)
+            lock (_connsLock) _clientToken = token; // from now on lane 0 can re-attach
+            for (int lane = 1; lane < LaneCount; lane++) OpenLane(peer, token, lane);
+        }
+
+        private void OpenLane(ulong peer, ulong token, int l)
+        {
+            new Thread(() =>
             {
-                int l = lane;
-                new Thread(() =>
+                try
                 {
-                    try
-                    {
-                        var c = new TcpClient { NoDelay = true };
-                        IAsyncResult ar = c.BeginConnect(_hostIp, _hostPort, null, null);
-                        if (!ar.AsyncWaitHandle.WaitOne(5000)) { try { c.Close(); } catch { } return; }
-                        c.EndConnect(ar);
-                        lock (_connsLock) if (_closed || !_peers.ContainsKey(peer)) { c.Close(); return; }
-                        var hello = new byte[10];
-                        hello[0] = LaneHelloTag;
-                        Buffer.BlockCopy(BitConverter.GetBytes(token), 0, hello, 1, 8);
-                        hello[9] = (byte)l;
-                        var conn = new Conn { Peer = peer, Lane = l, Bound = true, Client = c, Stream = c.GetStream() };
-                        conn.Out.Add(Frame(hello), false); // first frame on the wire
-                        Start(conn);
-                    }
-                    catch (Exception) { /* this lane stays closed: lane 0 carries its traffic */ }
-                }) { IsBackground = true, Name = "GMSCoop-Lane" }.Start();
-            }
+                    var c = new TcpClient { NoDelay = true };
+                    IAsyncResult ar = c.BeginConnect(_hostIp, _hostPort, null, null);
+                    if (!ar.AsyncWaitHandle.WaitOne(5000)) { try { c.Close(); } catch { } return; }
+                    c.EndConnect(ar);
+                    lock (_connsLock) if (_closed || !_peers.ContainsKey(peer)) { c.Close(); return; }
+                    var conn = new Conn { Peer = peer, Lane = l, Bound = true, Client = c, Stream = c.GetStream() };
+                    conn.Out.Add(Frame(LaneHello(token, l)), false); // first frame on the wire
+                    Start(conn);
+                }
+                catch (Exception) { /* this lane stays closed: lane 0 carries its traffic */ }
+            }) { IsBackground = true, Name = "GMSCoop-Lane" }.Start();
         }
 
         public int QueuedBytes(ulong peer)

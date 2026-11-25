@@ -27,6 +27,11 @@ namespace GMSCoop
     ///
     /// TCP path (ILaneTransport): lane 0 control + gameplay, lane 2 bulk, lanes 1 and 3 the same unreliable
     /// snapshots twice (a stalled TCP connection no longer delays poses). Without lanes, lane 0 carries all.
+    /// Reliable messages sent on the TCP path are kept until the receiver's cumulative acknowledgement
+    /// (control 9: [u32 next] per channel, every 0.25 s while it changes). If lane 0 drops, the peer is kept
+    /// (LanTransport re-attaches it): with a direct link up everything moves to UDP and Net's keep-alive
+    /// decides; without one the peer is reported gone after ReattachGrace. After a re-attach, everything not
+    /// acknowledged goes again.
     ///   tags: 0xE0 reliable [u8 ch][u32 seq][payload] · 0xE1 unreliable [u32 useq][payload] ·
     ///         0xE3 control [sub][...] · untagged: a peer without this layer (passed through, version check).
     ///
@@ -54,7 +59,10 @@ namespace GMSCoop
         internal static double[] RetryDelays = { 20, 45, 90, 180, 300 };
         internal static double PingInterval = 0.5;
         internal static double BaseKeepAlive = 2.0;
-        internal static double LegacyHelloAfter = 5.0; // no answer to a tagged Hello: try an untagged copy (old host)  // tunnel RTT probe + keep-alive while UDP carries the traffic
+        internal static double LegacyHelloAfter = 5.0; // no answer to a tagged Hello: try an untagged copy (old host)
+        // Lane 0 (TCP) dropped and no direct link: how long the client may take to re-attach before the peer is
+        // reported gone. With a direct link up the session goes on over UDP and Net's keep-alive decides.
+        internal static double ReattachGrace = 25.0;
         internal static bool UseLanes = true;
 
         internal const int ChControl = 0, ChGame = 1, ChBulk = 2, Channels = 3;
@@ -235,11 +243,20 @@ namespace GMSCoop
             public byte[] FirstHello;                     // client: its Hello, re-sent untagged if nobody answers (old host)
             public double FirstSendAt = -1;
             public bool HeardAny, LegacyHelloSent;
-            // TCP path, bulk channel: messages sent on lane 2 until the receiver acknowledges them (a lane can drop)
-            public readonly Queue<KeyValuePair<uint, byte[]>> TcpBulk = new Queue<KeyValuePair<uint, byte[]>>();
+            // TCP path: reliable messages kept per channel until the receiver acknowledges them (CtlChanAck), so a
+            // lane that drops (lane 2, or lane 0 before a re-attach) loses nothing: they go again.
+            public readonly Queue<KeyValuePair<uint, byte[]>>[] TcpUnacked =
+            {
+                new Queue<KeyValuePair<uint, byte[]>>(), new Queue<KeyValuePair<uint, byte[]>>(), new Queue<KeyValuePair<uint, byte[]>>(),
+            };
+            public long TcpUnackedBytes;
             public bool BulkLaneUp;
-            public uint ChanAckSent;
+            public readonly uint[] ChanAckSent = new uint[Channels];
             public double ChanAckAt;
+            public bool Lane0Down;                        // lane 0 dropped, waiting for the client to re-attach it
+            public double Lane0DownAt;                    // since when neither lane 0 nor a direct link carries the session
+            public bool ReattachPending;                  // a new lane 0 is up, nothing heard on it yet (it may be refused)
+            public int ReattachResent;
             public bool WasUp;                            // the direct link worked at least once
             public readonly Queue<ulong> SentNonces = new Queue<ulong>(), SeenNonces = new Queue<ulong>();
             public int BigLost;
@@ -323,18 +340,47 @@ namespace GMSCoop
                 uint seq = tx.NextSeq++;
                 if (UdpFor(l, ch) && data.Length <= MaxDirectMessage)
                 {
-                    // Fragments always fit the base MTU (1200), so a step down never strands a re-send; a larger
-                    // proven MTU only packs more frames per packet. Room is left for an ACK frame.
-                    int fs = BaseMtu - SecureOverhead - StreamFrameHeader - 24;
-                    var m = new OutMsg { Ch = ch, Seq = seq, Data = data, FragSize = fs, Frags = Math.Max(1, (data.Length + fs - 1) / fs) };
-                    m.State = new byte[m.Frags];
-                    tx.Out.Add(m);
-                    tx.PendingBytes += data.Length;
+                    QueueUdp(l, ch, seq, data);
                     if (ch != ChBulk) Flush(l, now); // small gameplay messages leave right away
                     return true;
                 }
                 return SendTcpReliable(l, ch, seq, data);
             }
+        }
+
+        private static void QueueUdp(Link l, int ch, uint seq, byte[] data)
+        {
+            // Fragments always fit the base MTU (1200), so a step down never strands a re-send; a larger
+            // proven MTU only packs more frames per packet. Room is left for an ACK frame.
+            int fs = BaseMtu - SecureOverhead - StreamFrameHeader - 24;
+            var m = new OutMsg { Ch = ch, Seq = seq, Data = data, FragSize = fs, Frags = Math.Max(1, (data.Length + fs - 1) / fs) };
+            m.State = new byte[m.Frags];
+            SendChannel tx = l.Tx[ch];
+            tx.Out.Add(m);
+            tx.PendingBytes += data.Length;
+        }
+
+        /// <summary>
+        /// Lane 0 dropped while the direct link is up: what the TCP path had not delivered goes over UDP now
+        /// (the receiver drops duplicates; if UDP fails too, Fallback puts it back on the TCP path).
+        /// </summary>
+        private int MoveTcpUnackedToUdp(Link l)
+        {
+            int n = 0;
+            for (int ch = 0; ch < Channels; ch++)
+            {
+                var keep = new List<KeyValuePair<uint, byte[]>>();
+                foreach (var kv in l.TcpUnacked[ch])
+                {
+                    if (kv.Value.Length > MaxDirectMessage) { keep.Add(kv); continue; }
+                    QueueUdp(l, ch, kv.Key, kv.Value);
+                    l.TcpUnackedBytes -= kv.Value.Length;
+                    n++;
+                }
+                l.TcpUnacked[ch].Clear();
+                foreach (var kv in keep) l.TcpUnacked[ch].Enqueue(kv);
+            }
+            return n;
         }
 
         /// <summary>
@@ -344,6 +390,21 @@ namespace GMSCoop
         private static bool UdpFor(Link l, int ch) => l.SendDirect && (ch == ChBulk || l.GameOnDirect);
 
         private bool SendTcpReliable(Link l, int ch, uint seq, byte[] data)
+        {
+            if (_lanes != null)
+            {
+                // Kept until the receiver acknowledges it: if its lane drops, it goes again (lane 2 -> lane 0,
+                // lane 0 -> the re-attached lane 0). Queued even when the lane is down right now.
+                l.TcpUnacked[ch].Enqueue(new KeyValuePair<uint, byte[]>(seq, data));
+                l.TcpUnackedBytes += data.Length;
+                SendTcpFrame(l, ch, seq, data);
+                return true;
+            }
+            return SendTcpFrame(l, ch, seq, data);
+        }
+
+        /// <summary>One reliable message on the TCP path (bulk on lane 2 when open), not kept.</summary>
+        private bool SendTcpFrame(Link l, int ch, uint seq, byte[] data)
         {
             var b = new byte[6 + data.Length];
             b[0] = TagReliable;
@@ -355,14 +416,24 @@ namespace GMSCoop
             {
                 if (ch == ChBulk && _lanes.HasLane(l.Peer, LaneBulk))
                 {
-                    // Kept until the receiver acknowledges it: if lane 2 drops, it goes again on lane 0.
-                    l.TcpBulk.Enqueue(new KeyValuePair<uint, byte[]>(seq, data));
                     l.BulkLaneUp = true;
                     return _lanes.SendLane(l.Peer, LaneBulk, b, false);
                 }
                 return _lanes.SendLane(l.Peer, Lane0, b, false);
             }
             return _base.Send(l.Peer, b, true);
+        }
+
+        /// <summary>Everything the receiver has not acknowledged on the TCP path goes again (it drops duplicates).</summary>
+        private int ResendTcpUnacked(Link l, int onlyCh = -1)
+        {
+            int n = 0;
+            for (int ch = 0; ch < Channels; ch++)
+            {
+                if (onlyCh >= 0 && ch != onlyCh) continue;
+                foreach (var kv in l.TcpUnacked[ch]) { SendTcpFrame(l, ch, kv.Key, kv.Value); n++; }
+            }
+            return n;
         }
 
         private bool SendUnreliable(Link l, byte[] data, double now)
@@ -401,6 +472,8 @@ namespace GMSCoop
                 {
                     q += l.BytesInFlight;
                     foreach (SendChannel tx in l.Tx) q += tx.PendingBytes;
+                    // Lane 0 down: what waits for the re-attach counts too (senders throttle on this).
+                    if (l.Lane0Down) q += (int)Math.Min(int.MaxValue / 2, l.TcpUnackedBytes);
                 }
                 return q;
             }
@@ -422,7 +495,7 @@ namespace GMSCoop
                 foreach (Link l in _links.Values.ToList())
                 {
                     if (_closed) return;
-                    if (_links.ContainsKey(l.Peer)) TickLink(l, now);
+                    if (_links.ContainsKey(l.Peer)) TickLink(l, now, onPacket);
                 }
             }
         }
@@ -478,6 +551,41 @@ namespace GMSCoop
 
         private void OnBasePacket(Packet p, Action<Packet> onPacket, double now)
         {
+            if (p.Data == null && p.Event == LaneEvent.Detached)
+            {
+                // Lane 0 dropped; the transport keeps the peer and the client reconnects it. Not a disconnect.
+                if (!_links.TryGetValue(p.From, out Link dl)) return;
+                // A re-attached lane 0 that dropped before anything arrived on it (refused, or a local bridge
+                // whose tunnel is gone) does not restart the grace period.
+                bool retry = dl.ReattachPending; // a refused attempt, not a new drop
+                if (!retry || dl.SendDirect) dl.Lane0DownAt = now;
+                dl.Lane0Down = true;
+                dl.ReattachPending = false;
+                int moved = 0;
+                if (dl.SendDirect)
+                {
+                    dl.GameOnDirect = true; // the direct link carries everything until lane 0 is back
+                    moved = MoveTcpUnackedToUdp(dl);
+                }
+                if (!retry) Log($"Direct: TCP connection to {dl.Peer} dropped; " + (dl.SendDirect
+                    ? $"the session goes on over the direct link ({moved} message(s) moved there) while it reconnects"
+                    : $"waiting up to {ReattachGrace:0} s for it to reconnect"));
+                return;
+            }
+            if (p.Data == null && p.Event == LaneEvent.Reattached)
+            {
+                if (!_links.TryGetValue(p.From, out Link a)) return;
+                a.Lane0Down = false;
+                a.ReattachPending = true; // confirmed by the first packet from the other side
+                int n = ResendTcpUnacked(a);
+                // Acknowledge again at once: the other side's copy of what we got may be stale.
+                for (int ch = 0; ch < Channels; ch++) a.ChanAckSent[ch] = uint.MaxValue;
+                a.ChanAckAt = double.NegativeInfinity;
+                // An offer or answer may have been lost with the old connection: start the handshake again.
+                if (!_isHost && (a.State == DState.WaitAnswer || a.State == DState.Gathering) && !a.SendDirect) a.State = DState.Idle;
+                a.ReattachResent = n; // logged once the new connection is confirmed
+                return;
+            }
             if (p.Data == null)
             {
                 if (_links.TryGetValue(p.From, out Link gone)) RemoveLink(gone);
@@ -491,6 +599,11 @@ namespace GMSCoop
             int len = p.Length > 0 ? p.Length : d.Length;
             if (len == 0) return;
             l.HeardAny = true;
+            if (p.Lane == 0 && l.ReattachPending)
+            {
+                l.ReattachPending = false; // the re-attached lane 0 works
+                Log($"Direct: TCP connection to {l.Peer} is back; {l.ReattachResent} unacknowledged message(s) re-sent");
+            }
             if (d[0] == TagReliable || d[0] == TagUnreliable || d[0] == TagControl) l.Tagged = true;
             else if (!l.Tagged) l.Legacy = true;
             else return; // untagged after tagged traffic (a late untagged Hello copy): ignored
@@ -644,8 +757,13 @@ namespace GMSCoop
                     return;
                 case CtlChanAck:
                 {
-                    uint next = r.ReadUInt32();
-                    while (l.TcpBulk.Count > 0 && l.TcpBulk.Peek().Key < next) l.TcpBulk.Dequeue();
+                    // [u32 next expected sequence] per channel (control, gameplay, bulk), cumulative.
+                    for (int ch = 0; ch < Channels && r.BaseStream.Position + 4 <= r.BaseStream.Length; ch++)
+                    {
+                        uint next = r.ReadUInt32();
+                        Queue<KeyValuePair<uint, byte[]>> q = l.TcpUnacked[ch];
+                        while (q.Count > 0 && q.Peek().Key < next) l.TcpUnackedBytes -= q.Dequeue().Value.Length;
+                    }
                     return;
                 }
                 case CtlKeepAlive:
@@ -675,7 +793,9 @@ namespace GMSCoop
             try { _myCandidates = _gather.Result ?? new List<IPEndPoint>(); }
             catch (Exception ex) { _myCandidates = new List<IPEndPoint>(); Log("Direct: candidate gathering failed: " + ex.Message); }
             _gather = null;
-            _candidatesAt = Clock();
+            // Without a public (STUN) address, STUN was unreachable: do not reuse this list, ask again next time.
+            bool hasPublic = _myCandidates.Any(c => !IsLocalAddress(c.Address));
+            _candidatesAt = hasPublic ? Clock() : double.NegativeInfinity;
             Log("Direct: my candidates: " + string.Join(", ", _myCandidates) + (_udp?.NatInfo != null ? " (" + _udp.NatInfo + ")" : ""));
             GatherReady();
         }
@@ -775,10 +895,27 @@ namespace GMSCoop
             SendRaw(l, d, d.Length, to);
         }
 
-        private void TickLink(Link l, double now)
+        private void TickLink(Link l, double now, Action<Packet> onPacket)
         {
-            // Client: offer a direct connection once the session is up, and again after a failure.
-            if (!_isHost && _offerDirect && l.BaseSeen && !l.Legacy)
+            // Lane 0 down: while the direct link is up it carries the session (Net's keep-alive decides); with
+            // neither path for too long, the peer is gone.
+            if (l.Lane0Down || l.ReattachPending)
+            {
+                if (l.SendDirect) l.Lane0DownAt = now;
+                else if (now - l.Lane0DownAt > ReattachGrace)
+                {
+                    Log($"Direct: {l.Peer}: no TCP connection and no direct link for {ReattachGrace:0} s: peer lost");
+                    RemoveLink(l);
+                    _removed.Add(l.Peer);
+                    _base.Disconnect(l.Peer);
+                    onPacket(new Packet { From = l.Peer, Data = null });
+                    return;
+                }
+            }
+
+            // Client: offer a direct connection once the session is up, and again after a failure (the
+            // handshake needs the TCP path).
+            if (!_isHost && _offerDirect && l.BaseSeen && !l.Legacy && !l.Lane0Down)
             {
                 if (l.State == DState.Idle || (l.State == DState.Failed && now >= l.NextRetry))
                 {
@@ -815,27 +952,29 @@ namespace GMSCoop
             if (l.BulkLaneUp && _lanes != null && !_lanes.HasLane(l.Peer, LaneBulk))
             {
                 l.BulkLaneUp = false;
-                int n = l.TcpBulk.Count;
-                var again = l.TcpBulk.ToList();
-                l.TcpBulk.Clear();
-                foreach (var kv in again) SendTcpReliable(l, ChBulk, kv.Key, kv.Value);
+                int n = ResendTcpUnacked(l, ChBulk);
                 Log($"Direct: bulk lane to {l.Peer} closed; {n} unacknowledged message(s) re-sent on the main connection");
             }
 
-            // Receiver side of that: acknowledge the bulk channel over the tunnel (cumulative).
-            uint bulkNext = l.Rx[ChBulk].Next;
-            if (l.Tagged && bulkNext != l.ChanAckSent && now - l.ChanAckAt >= 0.25)
+            // Receiver side of that: acknowledge every channel over the TCP path (cumulative).
+            if (l.Tagged && !l.Lane0Down && now - l.ChanAckAt >= 0.25)
             {
-                l.ChanAckSent = bulkNext;
-                l.ChanAckAt = now;
-                SendControl(l, CtlChanAck, w => w.Write(bulkNext));
+                bool changed = false;
+                for (int ch = 0; ch < Channels; ch++) if (l.Rx[ch].Next != l.ChanAckSent[ch]) changed = true;
+                if (changed)
+                {
+                    var next = new uint[Channels];
+                    for (int ch = 0; ch < Channels; ch++) l.ChanAckSent[ch] = next[ch] = l.Rx[ch].Next;
+                    l.ChanAckAt = now;
+                    SendControl(l, CtlChanAck, w => { foreach (uint v in next) w.Write(v); });
+                }
             }
 
             foreach (SendChannel tx in l.Tx)
                 if (tx.Done > 32 && tx.Done * 2 >= tx.Out.Count) Compact(tx);
 
             // Tunnel RTT probe and keep-alive on lane 0 (also while UDP carries everything).
-            if (l.Tagged && !l.Legacy && now - l.LastTcpPing >= BaseKeepAlive)
+            if (l.Tagged && !l.Legacy && !l.Lane0Down && now - l.LastTcpPing >= BaseKeepAlive)
             {
                 l.LastTcpPing = now;
                 SendControl(l, CtlPing, w => w.Write(now));
@@ -864,7 +1003,7 @@ namespace GMSCoop
         /// <summary>Gameplay takes the faster healthy path: the direct link, unless the tunnel is clearly faster.</summary>
         private void ChoosePath(Link l)
         {
-            if (!l.HasRtt || l.TcpRttSamples < 3) { l.GameOnDirect = true; return; }
+            if (!l.HasRtt || l.TcpRttSamples < 3 || l.Lane0Down || l.ReattachPending) { l.GameOnDirect = true; return; }
             bool direct = l.GameOnDirect;
             if (direct && l.TcpRtt + 0.015 < l.Srtt * 0.8) direct = false;          // tunnel 20 % and 15 ms faster
             else if (!direct && l.Srtt <= l.TcpRtt + 0.005) direct = true;
@@ -913,6 +1052,9 @@ namespace GMSCoop
             l.Mtu = BaseMtu;
             l.ProbeTries = 0;
             Log($"Direct: back to {_baseLabel(l.Peer)} with {l.Peer} ({why}); {n} message(s) re-sent there. {StatsOf(l)}");
+            // A link that worked and broke: the network may have changed (Wi-Fi switch, new public address).
+            // The next try gathers fresh candidates instead of the cached ones.
+            if (retry && wasUp) _candidatesAt = double.NegativeInfinity;
             if (retry) Fail(l, why, Clock(), quick: wasUp);
             else l.State = DState.Idle;
         }
@@ -964,6 +1106,7 @@ namespace GMSCoop
                     l.Cwnd = InitialCwnd;
                     l.Ssthresh = MaxCwnd;
                     l.RtoBackoff = 0;
+                    l.LastAckProgress = now;
                     l.NextProbe = now + 1;
                     l.NextStats = now + 30;
                     l.LastPace = now;
@@ -1240,7 +1383,11 @@ namespace GMSCoop
                 }
             }
             if (rto) l.Cwnd = Math.Max(MinCwnd, l.Cwnd / 2);
-            if (l.RtoBackoff >= 6) Fallback(l, "no acknowledgement after 6 timeouts", retry: true);
+            // Many timeouts in a row: the path lost one direction (our packets no longer arrive, theirs still
+            // do). On a fast link six back-offs take only ~6 s, so it also has to be as long as the stall limit
+            // (the other PC may freeze for seconds while loading).
+            if (l.RtoBackoff >= 6 && now - l.LastAckProgress > StallTimeout)
+                Fallback(l, $"no acknowledgement for {StallTimeout:0.#} s", retry: true);
         }
 
         // =====================================================================================
@@ -1478,6 +1625,15 @@ namespace GMSCoop
             var b = new byte[8];
             _rng.GetBytes(b);
             return BitConverter.ToUInt64(b, 0);
+        }
+
+        /// <summary>Loopback, private, link-local or CGNAT (100.64/10): not a public STUN mapping.</summary>
+        private static bool IsLocalAddress(IPAddress a)
+        {
+            if (a.AddressFamily != AddressFamily.InterNetwork) return true;
+            byte[] b = a.GetAddressBytes();
+            return b[0] == 127 || b[0] == 10 || (b[0] == 172 && b[1] >= 16 && b[1] <= 31) || (b[0] == 192 && b[1] == 168) ||
+                   (b[0] == 169 && b[1] == 254) || (b[0] == 100 && b[1] >= 64 && b[1] <= 127);
         }
 
         private static byte[] Slice(byte[] d, int off, int len)

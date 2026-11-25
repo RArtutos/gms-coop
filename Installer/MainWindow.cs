@@ -784,6 +784,8 @@ namespace GMSCoopInstaller
                 Ui.Interactive(card, () =>
                 {
                     if (!sameVersion) { CheckForUpdateNow(target.Version); return; } // MainWindow.Update.cs
+                    if (!Prepare(out string err)) { if (err != null) Status(err, Tone.Error); return; }
+                    StopBridges();
                     Launch("--coop-join " + target.Ip + ":" + target.Port, "Entrando a la partida de " + target.Name + "...");
                 }, Ui.CardColor, Ui.CardHover);
                 _lanCards.Children.Add(card);
@@ -975,7 +977,11 @@ namespace GMSCoopInstaller
             if (!upToDate)
             {
                 if (GameInstall.GameRunning()) { error = "El mod necesita actualizarse: cierra el juego primero."; return false; }
+                Status("Instalando el mod " + GameInstall.VersionText + "...", Tone.Busy);
+                try { Dispatcher.Invoke(() => { }, DispatcherPriority.Render); } catch { } // show the message before the short install
                 try { Status(GameInstall.Install(_game)); }
+                catch (UnauthorizedAccessException) { error = "No se pudo instalar el mod: Windows no dejó escribir en la carpeta del juego. Cierra el juego y vuelve a intentar (o abre GMS Co-op como administrador)."; return false; }
+                catch (IOException) { error = "No se pudo instalar el mod: un archivo del juego está en uso. Cierra el juego (y el antivirus si lo bloquea) y vuelve a intentar."; return false; }
                 catch (Exception ex) { error = "No se pudo instalar el mod: " + ex.Message; return false; }
             }
             GameInstall.EnsureSteamAppId(_game);
@@ -1016,9 +1022,12 @@ namespace GMSCoopInstaller
             Status("Preparando Cloudflare...", Tone.Busy);
             Task.Run(() =>
             {
+                // The game hosts on its configured port: it must be free before the code goes out.
+                int gamePort = Cloudflare.GamePort(_game);
+                Cloudflare.CheckPortFree(gamePort);
                 Cloudflare.EnsureCloudflared(msg => Status(msg, Tone.Busy));
                 Status("Abriendo el túnel de Cloudflare...", Tone.Busy);
-                var bridge = new HostBridge(27777, msg => Status(msg));
+                var bridge = new HostBridge(gamePort, msg => Status(msg));
                 bridge.Start(TimeSpan.FromSeconds(30));
                 return bridge;
             }).ContinueWith(t =>

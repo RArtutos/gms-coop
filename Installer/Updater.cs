@@ -44,8 +44,19 @@ namespace GMSCoopInstaller
         {
             try
             {
-                string old = ExePath + ".old";
-                if (File.Exists(old)) File.Delete(old);
+                string exe = ExePath;
+                try { if (File.Exists(exe + ".new")) File.Delete(exe + ".new"); } catch { } // a download that stopped halfway
+                string old = exe + ".old";
+                if (!File.Exists(old)) return;
+                // Right after an update the previous launcher may still be closing: retry for a few seconds.
+                Task.Run(() =>
+                {
+                    for (int i = 0; i < 20; i++)
+                    {
+                        try { if (!File.Exists(old)) return; File.Delete(old); return; }
+                        catch { System.Threading.Thread.Sleep(500); }
+                    }
+                });
             }
             catch { }
         }
@@ -53,8 +64,12 @@ namespace GMSCoopInstaller
         private static string ExePath => Process.GetCurrentProcess().MainModule.FileName;
 
         /// <summary>The latest release if it is newer than this launcher, else null (also on any error).</summary>
+        /// <summary>True when the last check could not reach GitHub (offline, rate limit): "no update" is then unknown.</summary>
+        internal static volatile bool LastCheckFailed;
+
         internal static Task<Release> CheckAsync() => Task.Run(() =>
         {
+            LastCheckFailed = false;
             try
             {
                 if (string.IsNullOrEmpty(ReleasesApi)) return null;
@@ -77,7 +92,7 @@ namespace GMSCoopInstaller
                 if (exe == null || sha == null) return null; // never install an unverified file
                 return new Release { Version = v, Tag = "v" + v, ExeUrl = exe, ShaUrl = sha };
             }
-            catch { return null; }
+            catch { LastCheckFailed = true; return null; }
         });
 
         /// <summary>Downloads, verifies and swaps in the new launcher, then starts it. Throws with a readable message on failure.</summary>
@@ -87,7 +102,8 @@ namespace GMSCoopInstaller
             if (expected.Length != 64) throw new InvalidOperationException("la actualización no trae una huella válida");
             string exe = ExePath;
             string tmp = exe + ".new";
-            Download(r.ExeUrl, tmp);
+            try { Download(r.ExeUrl, tmp); }
+            catch { try { File.Delete(tmp); } catch { } throw; }
             string actual;
             using (var sha = SHA256.Create())
             using (var f = File.OpenRead(tmp))

@@ -54,6 +54,11 @@ namespace GMSCoopInstaller
             Status("Esa partida usa la versión " + otherVersion + ": buscando actualización...", Tone.Busy);
             Updater.CheckAsync().ContinueWith(t =>
             {
+                if (t.Result == null && Updater.LastCheckFailed)
+                {
+                    Status("Esa partida usa la versión " + otherVersion + " y no pude revisar si hay actualización (¿sin internet?). Intenta de nuevo en un momento.", Tone.Error);
+                    return;
+                }
                 if (t.Result == null)
                 {
                     Status("Esa partida usa otra versión del mod (v" + otherVersion + "). Pídele al host que actualice GMS Co-op.", Tone.Error);

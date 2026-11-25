@@ -34,7 +34,8 @@ namespace GMSCoop
         {
             try
             {
-                if (!SaveTransfer.ClientSession) ApplyLauncherPromo();
+                // Not while the host's world is still loaded here (host-lost prompt, end backup): its values count.
+                if (!SaveTransfer.ClientSession && !SaveTransfer.HostWorldLoaded && !CoopSaves.HoldRestore) ApplyLauncherPromo();
                 if (Net.Active && Net.IsHost) { HostSync(); return; }
                 if (SaveTransfer.ClientSession)
                 {
@@ -48,7 +49,17 @@ namespace GMSCoop
                 }
                 if (_inHostWorld && !Net.Active)
                 {
+                    // Host-lost prompt or end-of-session backup: the host's world is still played and saved
+                    // here with the host's values (GameStateManager.Serialize writes them into the save).
+                    if (CoopSaves.HoldRestore) return;
+                    if (SaveTransfer.HostWorldLoaded) return; // still in it until the own slot / main menu replaces it
                     _inHostWorld = false;
+                    if (SaveTransfer.ConsumeKeptAsOwn())
+                    {
+                        // [G]: the shared world became this player's own; its settings stay with it.
+                        _haveOwn = false;
+                        return;
+                    }
                     Restore();
                     return;
                 }
@@ -107,6 +118,7 @@ namespace GMSCoop
         private static readonly HashSet<ulong> SettingsSentTo = new HashSet<ulong>();
         private static float _nextHostCheck, _resendAt;
         private static int _sentWorld = int.MinValue;
+        private static object _sentTransport;
 
         private static void HostSync()
         {
@@ -136,8 +148,12 @@ namespace GMSCoop
                 _resendAt = 0f;
                 changed = true;
             }
+            // A new host session starts clean (F7 then F8 with the same world keeps the old Steam ids).
+            if (!ReferenceEquals(Net.Transport, _sentTransport)) { _sentTransport = Net.Transport; changed = true; }
             if (changed) SettingsSentTo.Clear();
-            SettingsSentTo.RemoveWhere(p => !Net.Peers.Contains(p));
+            // A player who rejoins (crash and restart, same Steam id) is not ready while the world is sent
+            // again: it gets the settings once more when it is.
+            SettingsSentTo.RemoveWhere(p => !Net.Peers.Contains(p) || !SaveTransfer.PeerReady(p));
             byte[] data = null;
             foreach (ulong p in Net.Peers)
             {

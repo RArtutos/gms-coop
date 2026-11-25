@@ -82,16 +82,72 @@ namespace GMSCoop
         /// <summary>
         /// The json belongs to the save next to it: false when CheckpointData.sav was written well after the
         /// json (the slot was reused by another world, for example "AutoSave", and the json is stale).
+        /// Both times are file times of this PC (never LastSavedUtc, which may come from another PC's clock
+        /// or from a save made long before the files were copied / received).
         /// </summary>
         internal static bool IsFresh(string slot, WorldIdentity id)
         {
             try
             {
-                if (id == null || id.LastSavedUtc == default) return false;
-                string data = Path.Combine(SlotDir(slot), "CheckpointData.sav");
-                return File.Exists(data) && File.GetLastWriteTimeUtc(data) <= id.LastSavedUtc.AddMinutes(3);
+                if (id == null) return false;
+                string dir = SlotDir(slot);
+                string data = Path.Combine(dir, "CheckpointData.sav"), json = Path.Combine(dir, FileName);
+                return File.Exists(data) && File.Exists(json) &&
+                       File.GetLastWriteTimeUtc(data) <= File.GetLastWriteTimeUtc(json).AddMinutes(3);
             }
             catch { return false; }
+        }
+
+        /// <summary>
+        /// Rewrites the slot's json unchanged, so its file time follows the save next to it (after a copy, an
+        /// unpack or a save into the slot that is not stamped, e.g. a client's save into Coop_Host).
+        /// </summary>
+        internal static void Touch(string slot)
+        {
+            try
+            {
+                WorldIdentity id = Read(slot);
+                if (id != null) id.Write(slot);
+            }
+            catch (Exception ex) { Plugin.Log.LogWarning("World identity: could not refresh " + slot + ": " + ex.Message); }
+        }
+
+        /// <summary>A slot name not used yet: <paramref name="name"/>, else name_2, name_3...</summary>
+        internal static string FreeSlotName(string name)
+        {
+            if (!Directory.Exists(SlotDir(name))) return name;
+            for (int i = 2; i < 1000; i++)
+                if (!Directory.Exists(SlotDir(name + "_" + i))) return name + "_" + i;
+            return name + "_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+        }
+
+        /// <summary>
+        /// Startup: removes the mod's own temp folders left by a crash or a failed step (they hold a
+        /// CheckpointData.sav, so the game's load menu would list them as slots). Only these exact patterns,
+        /// only directly inside the Saves folder: "*.incoming", "*.rechazada", "Coop_Respaldo_*.tmp".
+        /// </summary>
+        internal static void CleanLeftovers()
+        {
+            try
+            {
+                string root = GameSaveManager.GetSavePath();
+                if (string.IsNullOrEmpty(root) || !Directory.Exists(root)) return;
+                foreach (string dir in Directory.GetDirectories(root))
+                {
+                    string name = Path.GetFileName(dir);
+                    bool leftover = name.EndsWith(".incoming", StringComparison.Ordinal) ||
+                                    name.EndsWith(".rechazada", StringComparison.Ordinal) ||
+                                    (name.StartsWith(BackupPrefix, StringComparison.Ordinal) && name.EndsWith(".tmp", StringComparison.Ordinal));
+                    if (!leftover) continue;
+                    try
+                    {
+                        Directory.Delete(dir, true);
+                        Plugin.Log.LogInfo("Saves: removed leftover folder " + name);
+                    }
+                    catch (Exception ex) { Plugin.Log.LogWarning("Saves: could not remove " + name + ": " + ex.Message); }
+                }
+            }
+            catch (Exception ex) { Plugin.Log.LogWarning("Saves: leftover scan failed: " + ex.Message); }
         }
 
         /// <summary>Reads the identity of a slot only if it still belongs to the save in it.</summary>
@@ -122,6 +178,8 @@ namespace GMSCoop
                 foreach (string dir in Directory.GetDirectories(root))
                 {
                     string slot = Path.GetFileName(dir);
+                    if (slot.EndsWith(".incoming", StringComparison.Ordinal) || slot.EndsWith(".rechazada", StringComparison.Ordinal) ||
+                        slot.EndsWith(".tmp", StringComparison.Ordinal)) continue; // the mod's temp folders
                     if (!File.Exists(Path.Combine(dir, FileName)) || !File.Exists(Path.Combine(dir, "CheckpointData.sav"))) continue;
                     WorldIdentity id = ReadFresh(slot);
                     if (id != null && id.WorldId == worldId) list.Add(new KeyValuePair<string, WorldIdentity>(slot, id));

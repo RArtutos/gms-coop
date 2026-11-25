@@ -1797,6 +1797,10 @@ namespace GMSCoop
             foreach (Entry e in All)
             {
                 if (e.HeldBy == who) { e.HeldBy = 0; Held.Remove(e); }
+                // Its clock goes away below: a restarted game (same Steam id, new small stamps) must not
+                // have every pose dropped as older than the stamps it left here.
+                if (e.LastRestFrom == who) e.LastRestFrom = 0;
+                if (e.DropFrom == who) e.DropFrom = 0;
                 if (e.Owner != who || e.Go == null) continue;
                 if (e.Rb == null || Frozen(e)) { e.Owner = 0; continue; } // bed cargo: BedSync
                 LocalClaim(e, grab: false);

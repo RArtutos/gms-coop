@@ -50,7 +50,7 @@ namespace GMSCoop
     internal static class Net
     {
         /// <summary>Wire protocol of this build. Both PCs need the same one.</summary>
-        internal const int Protocol = 15;
+        internal const int Protocol = 16;
 
         private const float PingInterval = 0.5f;
         private const byte PingKind = 0, PongKind = 1;

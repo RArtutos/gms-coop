@@ -47,7 +47,7 @@ namespace GMSCoopInstaller
             if (string.IsNullOrWhiteSpace(s)) return null;
             var sb = new StringBuilder();
             foreach (char c in s.Trim())
-                if (!char.IsControl(c) && c != '"' && c != '<' && c != '>') sb.Append(c);
+                if (!char.IsControl(c) && c != '"' && c != '\\' && c != '<' && c != '>') sb.Append(c); // a backslash before the closing quote breaks the command line
             string n = sb.ToString().Trim();
             if (n.Length > 20) n = n.Substring(0, 20).Trim();
             return n.Length == 0 ? null : n;
@@ -252,19 +252,30 @@ namespace GMSCoopInstaller
             {
                 if (!File.Exists(path)) return;
                 string text;
+                const long MaxBytes = 16L * 1024 * 1024; // a huge log keeps only its end (the newest lines)
                 using (var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
-                using (var r = new StreamReader(f, Encoding.UTF8, true))
-                    text = r.ReadToEnd();
+                {
+                    bool cut = f.Length > MaxBytes;
+                    if (cut) f.Seek(-MaxBytes, SeekOrigin.End);
+                    using (var r = new StreamReader(f, Encoding.UTF8, true))
+                        text = (cut ? "[... solo los últimos 16 MB del archivo ...]\n" : "") + r.ReadToEnd();
+                }
                 AddString(zip, entry, text);
             }
-            catch { }
+            catch (Exception ex)
+            {
+                try { AddString(zip, entry + ".error.txt", "No se pudo leer " + Path.GetFileName(path) + ": " + ex.GetType().Name + " " + ex.Message); } catch { }
+            }
         }
 
         private static void AddString(ZipArchive zip, string entry, string text)
         {
-            string user = Environment.UserName;
-            if (!string.IsNullOrEmpty(user) && user.Length > 1)
-                text = text.Replace("\\Users\\" + user, "\\Users\\<user>").Replace("/Users/" + user, "/Users/<user>");
+            text = text ?? "";
+            string profileDir = null;
+            try { profileDir = Path.GetFileName(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile).TrimEnd('\\')); } catch { }
+            foreach (string user in new[] { profileDir, Environment.UserName })
+                if (!string.IsNullOrEmpty(user) && user.Length > 1)
+                    text = text.Replace("\\Users\\" + user, "\\Users\\<user>").Replace("/Users/" + user, "/Users/<user>");
             ZipArchiveEntry e = zip.CreateEntry(entry, CompressionLevel.Optimal);
             using (var w = new StreamWriter(e.Open(), new UTF8Encoding(false))) w.Write(text ?? "");
         }

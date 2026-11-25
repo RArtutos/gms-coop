@@ -118,6 +118,7 @@ namespace GMSCoop
         private static float _nextWaitStatus;
         private static int _nextTransferId = 1;
         private static string _savingSlot;  // slot the transfer save was written to
+        private static int _revBeforeSave;  // host world revision right before the transfer save
         private static bool _ownSave;       // inside our own QuickSave call
 
         // Host world tracking: away = not in a playable world (loading, main menu).
@@ -350,8 +351,12 @@ namespace GMSCoop
 
             // A host playing a Coop_Host world (loaded by hand) must not save into the folder a client
             // on the same PC writes the received world to.
+            CoopSaves.UseWorldSlot(); // not into the rotating "AutoSave" / "QuickSave" the game may have left current
             if (GameSaveManager.GetCurrentSlotName() == CoopSlot) GameSaveManager.SetCurrentSlot(CoopSlot + "_Hosted");
             _savingSlot = GameSaveManager.GetCurrentSlotName();
+            // The host's revision before this save: a client's solo copy forked at or after it is newer than
+            // the host's world; one forked earlier means both sides played on (CoopSession.OnOffer).
+            _revBeforeSave = CoopSaves.HostIdentity?.Revision ?? 0;
             Plugin.Instance.SetStatus("Guardando la partida (" + _savingSlot + ") para enviarla...");
             _ownSave = true;
             try
@@ -415,6 +420,7 @@ namespace GMSCoop
                 PurchaseSync.AssignJournal(p);
                 WorldSync.AssignJournal(p);
                 WorldJournalStart[p] = _worldJournalMark;
+                CoopSession.NoteJoinRevision(p, _revBeforeSave);
                 int id = _nextTransferId++;
                 Sending.Add(new Outgoing { Peer = p, Id = id, Data = world, Count = count, StartedAt = Time.unscaledTime });
                 Awaiting[p] = id;
@@ -565,6 +571,9 @@ namespace GMSCoop
         private static bool _restore;
         private static float _restoreSince;
         private static float _restoreLoadAt = -1f;
+        private static string _deferredLoad;   // own slot the player picked in the session, loaded once the end backup is written
+        private static float _deferredSince;
+        private static bool _keptAsOwn;        // the shared world became this player's own (host lost, kept playing)
         private static int _coopSceneHandle;
 
         /// <summary>True while this client plays (or is loading) the world it received from the host.</summary>
@@ -1010,6 +1019,7 @@ namespace GMSCoop
 
             if (Directory.Exists(target)) Directory.Delete(target, true);
             Directory.Move(temp, target);
+            WorldIdentity.Touch(CoopSlot); // the json's file time follows the files written here (IsFresh)
             Plugin.Log.LogInfo($"Save transfer: wrote {files} files of host slot '{hostSlot}' to {target}");
         }
 
@@ -1048,8 +1058,43 @@ namespace GMSCoop
         /// </summary>
         private static void RestoreTick()
         {
-            if (CoopSaves.HoldRestore) return; // saving a backup, or the host-lost prompt is up
             float now = Time.unscaledTime;
+            if (CoopSaves.HoldRestore)
+            {
+                // Saving a backup, or the host-lost prompt is up: the give-up timers start once it is over.
+                _restoreSince = now;
+                _deferredSince = now;
+                return;
+            }
+            if (_deferredLoad != null)
+            {
+                // The player's own slot, picked while in the session: load it now that the backup is written.
+                CheckpointManager dcpm = Checkpoints();
+                bool ready = dcpm != null && dcpm.GetLoadingState() == LoadingState.ReadyToPlay && !SaveBusy();
+                if (!ready)
+                {
+                    if (now - _deferredSince > 60f)
+                    {
+                        Plugin.Log.LogWarning("Save transfer: could not load the player's slot after the session (game busy)");
+                        _ownSlot = _deferredLoad; // GoToMainMenu makes it the current slot ("Continue")
+                        _deferredLoad = null;
+                        GoToMainMenu();
+                    }
+                    return;
+                }
+                string own = _deferredLoad;
+                _deferredLoad = null;
+                GameSaveManager.SetCurrentSlot(own);
+                CloseInGameMenu();
+                _coopSceneHandle = SceneManager.GetActiveScene().handle; // the world being left
+                _ownLoad = true;
+                try { dcpm.RequestLoad(); }
+                catch (Exception ex) { Plugin.Log.LogWarning("Save transfer: own slot load failed: " + ex.Message); }
+                finally { _ownLoad = false; }
+                _ownSlot = own;
+                _restoreLoadAt = now; // same check as a restore: main menu if the game refused it
+                return;
+            }
             if (_restoreLoadAt >= 0f)
             {
                 // The own slot was requested: done once the shared world is gone. If the game refused it
@@ -1168,6 +1213,8 @@ namespace GMSCoop
             // A new session started: its world replaces whatever is loaded; nothing to give back now.
             _restore = false;
             _restoreLoadAt = -1f;
+            _deferredLoad = null;
+            _keptAsOwn = false;
             if (Net.IsHost) HostTick();
             else ClientTick();
         }
@@ -1185,10 +1232,26 @@ namespace GMSCoop
         {
             _restore = false;
             _restoreLoadAt = -1f;
+            _deferredLoad = null;
             _hostWorldLoaded = false;
             _ownSlot = null;
+            _keptAsOwn = true;
             GameSaveManager.SetCurrentSlot(slot);
         }
+
+        /// <summary>SessionLifecycle: true once after KeepWorldAsOwn (the host's settings stay with that world).</summary>
+        internal static bool ConsumeKeptAsOwn()
+        {
+            bool k = _keptAsOwn;
+            _keptAsOwn = false;
+            return k;
+        }
+
+        /// <summary>The host's world (received in a session) is still the loaded one on this PC.</summary>
+        internal static bool HostWorldLoaded => _hostWorldLoaded;
+
+        /// <summary>Client: no world is announced, being received, loaded or caught up right now.</summary>
+        internal static bool ClientIdle => _clientPhase == ClientPhase.Idle && !_holdWorld;
 
         private static void Reset()
         {
@@ -1294,6 +1357,15 @@ namespace GMSCoop
                 Net.Shutdown();      // OnSessionEnded schedules a restore...
                 _restore = false;    // ...not needed: this load is the player's own game
                 _ownSlot = null;
+                if (SaveBusy())
+                {
+                    // The session end started a backup of the shared world (it also moved the current slot
+                    // to Coop_Host): the game would refuse this load now. It is made once the backup is done.
+                    _deferredLoad = slot;
+                    _deferredSince = Time.unscaledTime;
+                    return false;
+                }
+                GameSaveManager.SetCurrentSlot(slot);
                 return true;
             }
         }

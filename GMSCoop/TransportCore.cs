@@ -2,7 +2,15 @@ using System;
 
 namespace GMSCoop
 {
-    /// <summary>A received packet or a disconnect event (Data == null).</summary>
+    /// <summary>Connection events of a lane transport (Packet.Data == null).</summary>
+    internal enum LaneEvent : byte
+    {
+        Disconnected = 0, // the peer is gone
+        Detached = 1,     // lane 0 dropped; the peer is kept and may re-attach (LanTransport, consumed by HybridTransport)
+        Reattached = 2,   // a new lane 0 replaced the dropped one (consumed by HybridTransport)
+    }
+
+    /// <summary>A received packet or a connection event (Data == null, see Event).</summary>
     internal sealed class Packet
     {
         public ulong From;
@@ -10,6 +18,7 @@ namespace GMSCoop
         public int Length;
         public bool Reliable;
         public int Lane; // TCP lane it came on (LanTransport), 0 otherwise
+        public LaneEvent Event; // only with Data == null; Net only ever sees Disconnected
     }
 
     /// <summary>

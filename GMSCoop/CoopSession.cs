@@ -44,6 +44,9 @@ namespace GMSCoop
         // ---- client ----
         private static bool _checked;
         private static string _offerSlot;
+        // The solo copy this client uploaded (U): once the host plays it, the copy is no longer offered.
+        private static string _uploadedSlot, _uploadedWorld;
+        private static int _uploadedRev;
         private static byte[] _upData;
         private static int _upId, _upNext, _upCount;
         private static ulong _upPeer;
@@ -54,7 +57,14 @@ namespace GMSCoop
         private static string _offerName;
         private static int _offerRev, _ownRev;
         private static DateTime _offerSaved;
+        private static bool _offerConflict;           // both sides played on since the copy forked
+        private static string _offerWorld;
+        private static bool _offerSolo;
+        private static int _offerBase;
+        private static ulong _offerLocalId;
         private static bool _prompt, _receiving;
+        // Peer -> host world revision right before the save it was sent (SaveTransfer).
+        private static readonly Dictionary<ulong, int> JoinRevision = new Dictionary<ulong, int>();
         private static byte[] _rx;
         private static bool[] _rxGot;
         private static int _rxId, _rxCount, _rxHave;
@@ -83,8 +93,13 @@ namespace GMSCoop
         {
             _checked = false; _offerSlot = null; _upData = null;
             _prompt = false; _receiving = false; _rx = null; _rxGot = null;
+            _uploadedSlot = null; _uploadedWorld = null;
             IdentitySent.Clear();
+            JoinRevision.Clear();
         }
+
+        /// <summary>Host (SaveTransfer): <paramref name="peer"/> gets a save taken when the world had <paramref name="revBefore"/>.</summary>
+        internal static void NoteJoinRevision(ulong peer, int revBefore) => JoinRevision[peer] = revBefore;
 
         // ================================================================= identity
 
@@ -122,6 +137,7 @@ namespace GMSCoop
             id.MinutesPlayed = r.ReadDouble();
             if (string.IsNullOrEmpty(id.WorldId)) return;
             CoopSaves.OnHostIdentity(id);
+            if (_uploadedSlot != null && id.WorldId == _uploadedWorld && loadedRev == _uploadedRev) MarkMerged();
             if (_checked || !SaveTransfer.ClientSession) return;
             _checked = true;
             try { CheckNewerCopy(id, loadedRev); } catch (Exception ex) { Plugin.Log.LogWarning("World check: " + ex.Message); }
@@ -135,6 +151,26 @@ namespace GMSCoop
             if (_upData != null) PumpUpload();
         }
 
+        /// <summary>
+        /// Client: the host now plays the solo copy we uploaded (its loaded revision is the copy's): the copy is
+        /// part of the shared world again, so it is no longer offered as a separate version. Files untouched.
+        /// </summary>
+        private static void MarkMerged()
+        {
+            try
+            {
+                WorldIdentity c = WorldIdentity.Read(_uploadedSlot);
+                if (c != null && c.Solo && c.WorldId == _uploadedWorld && c.Revision == _uploadedRev)
+                {
+                    c.Solo = false;
+                    c.Write(_uploadedSlot);
+                    Plugin.Log.LogInfo($"World check: '{_uploadedSlot}' is now the host's world, no longer offered");
+                }
+            }
+            catch (Exception ex) { Plugin.Log.LogWarning("World check: could not update " + _uploadedSlot + ": " + ex.Message); }
+            _uploadedSlot = null;
+        }
+
         private static void CheckNewerCopy(WorldIdentity host, int hostLoadedRev)
         {
             if (Net.Peers.Count == 0) return;
@@ -142,7 +178,9 @@ namespace GMSCoop
             {
                 if (copy.Key == SaveTransfer.CoopSlot) continue;
                 WorldIdentity c = copy.Value;
-                bool newer = (c.Solo && c.BaseRevision >= hostLoadedRev) || c.Revision > host.Revision;
+                // A solo copy always counts (the host tells newer from "both played on"); others only when
+                // their revision is past the host's.
+                bool newer = c.Solo || c.Revision > host.Revision;
                 if (!newer) continue;
                 _offerSlot = copy.Key;
                 var ms = Begin(SubOffer, out var w);
@@ -152,7 +190,7 @@ namespace GMSCoop
                 w.Write(c.BaseRevision);
                 w.Write(c.LastSavedUtc.Ticks);
                 Net.Transport.Send(Net.Peers[0], ms.ToArray(), true);
-                Plugin.Instance.SetStatus($"Tienes una versión más nueva de este mundo ('{copy.Key}', rev {c.Revision}): el host decide cuál usar");
+                Plugin.Instance.SetStatus($"Tienes otra versión de este mundo ('{copy.Key}', rev {c.Revision}): el host decide cuál usar");
                 return;
             }
         }
@@ -182,6 +220,9 @@ namespace GMSCoop
                 _upNext = 0;
                 _upCount = Math.Max(1, (_upData.Length + ChunkSize - 1) / ChunkSize);
                 _upPeer = host;
+                _uploadedSlot = _offerSlot;
+                _uploadedWorld = id.WorldId;
+                _uploadedRev = id.Revision;
                 Plugin.Instance.SetStatus($"Enviando tu versión del mundo al host ({_upData.Length / 1024} KB)...");
             }
             catch (Exception ex)
@@ -248,7 +289,8 @@ namespace GMSCoop
                 else if (Input.GetKeyDown(KeyCode.N))
                 {
                     _prompt = false;
-                    Plugin.Instance.SetStatus("Sigues con tu versión del mundo (la de " + _offerName + " queda en su PC)");
+                    RememberDecline();
+                    Plugin.Instance.SetStatus("Sigues con tu versión del mundo (la de " + _offerName + " queda en su PC; no se te volverá a ofrecer)");
                 }
             }
             if (_receiving && Time.unscaledTime - _rxLast > 60f)
@@ -289,15 +331,44 @@ namespace GMSCoop
             var saved = new DateTime(r.ReadInt64(), DateTimeKind.Utc);
             WorldIdentity own = CoopSaves.HostIdentity;
             if (own == null || own.WorldId != worldId || _receiving || InstallPending) return;
-            bool newer = (solo && baseRev >= CoopSaves.HostLoadedRevision) || rev > own.Revision;
-            if (!newer) return;
+            // The host's revision right before the save this client got (the join save itself adds one).
+            int before = JoinRevision.TryGetValue(from, out int jr) ? jr : CoopSaves.HostLoadedRevision;
+            bool hostSavedSinceLoad = before > CoopSaves.HostLoadedRevision;
+            bool newer, conflict;
+            if (solo)
+            {
+                // Forked at or after the host's last save: the host has nothing the copy lacks.
+                newer = baseRev >= before;
+                conflict = !newer; // the host saved after the fork: both played on
+            }
+            else
+            {
+                // A copy of the shared world past the host's revision: newer only if the host has not played
+                // on since loading its (older) save, else the two differ.
+                newer = rev > before && !hostSavedSinceLoad;
+                conflict = rev > before && hostSavedSinceLoad;
+            }
+            if (!newer && !conflict) return;
+            ulong lid = Net.LocalIdOf(from);
+            if (WasDeclined(worldId, solo, baseRev, rev, lid, Net.NameOf(from)))
+            {
+                Plugin.Log.LogInfo($"World check: {Net.NameOf(from)}'s copy (rev {rev}) was declined before, not offered again");
+                return;
+            }
+            _offerWorld = worldId;
+            _offerSolo = solo;
+            _offerBase = baseRev;
+            _offerLocalId = lid;
             _offerPeer = from;
             _offerName = Net.NameOf(from);
             _offerRev = rev;
             _ownRev = own.Revision;
             _offerSaved = saved;
+            _offerConflict = conflict;
             _prompt = true;
-            Plugin.Instance.SetStatus($"{_offerName} tiene una versión más nueva de este mundo: [U] usar la suya / [N] seguir con la mía");
+            Plugin.Instance.SetStatus(conflict
+                ? $"{_offerName} y tú jugaron este mundo por separado: [U] usar su versión (la tuya se guarda aparte) / [N] seguir con la tuya"
+                : $"{_offerName} tiene una versión más nueva de este mundo: [U] usar la suya / [N] seguir con la mía");
         }
 
         private static void OnChunk(ulong from, BinaryReader r)
@@ -346,6 +417,7 @@ namespace GMSCoop
                     }
                 }
                 if (!File.Exists(Path.Combine(tmp, "CheckpointData.sav"))) throw new InvalidDataException("falta CheckpointData.sav");
+                WorldIdentity.Touch(slot + ".incoming"); // the json's file time follows the files written here (IsFresh)
                 _installTmp = tmp;
                 _installSlot = slot;
                 _installSince = Time.unscaledTime;
@@ -369,6 +441,7 @@ namespace GMSCoop
                 if (GameState.IsLoading || (cpm != null && cpm.GetLoadingState() != LoadingState.ReadyToPlay))
                 {
                     _loadCheck = false;
+                    _restoreDir = _restoreKeep = null;
                     Plugin.Log.LogInfo("World upload: load started");
                     return;
                 }
@@ -390,15 +463,16 @@ namespace GMSCoop
             string slot = _installSlot, tmp = _installTmp;
             _installTmp = null;
             string dir = WorldIdentity.SlotDir(slot);
-            string keep = slot + "_antes_" + DateTime.Now.ToString("yyyyMMdd_HHmm");
+            // Never over an earlier kept copy: a free name (seconds, then _2, _3...).
+            string keep = WorldIdentity.FreeSlotName(slot + "_antes_" + DateTime.Now.ToString("yyyyMMdd_HHmmss"));
             string keepDir = WorldIdentity.SlotDir(keep);
+            // Known before anything moves, so a failure half way (the second move) puts the host's slot back.
+            _restoreDir = dir;
+            _restoreKeep = keepDir;
             try
             {
-                if (Directory.Exists(keepDir)) Directory.Delete(keepDir, true);
                 if (Directory.Exists(dir)) Directory.Move(dir, keepDir);
                 Directory.Move(tmp, dir);
-                _restoreDir = dir;
-                _restoreKeep = keepDir;
                 Plugin.Instance.SetStatus($"Usando la versión de {_offerName} (tu versión anterior quedó en '{keep}'). Cargando...");
                 GameSaveManager.SetCurrentSlot(slot);
                 _loadCheck = true;
@@ -419,7 +493,9 @@ namespace GMSCoop
             {
                 if (_restoreKeep != null && Directory.Exists(_restoreKeep))
                 {
-                    string failed = _restoreDir + ".rechazada";
+                    // The refused upload is moved aside under a free name (removed at the next start).
+                    // (The uploading player still has its copy; a ".rechazada" folder is only the mod's own leftover.)
+                    string failed = _restoreDir + "_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".rechazada";
                     if (Directory.Exists(failed)) Directory.Delete(failed, true);
                     if (Directory.Exists(_restoreDir)) Directory.Move(_restoreDir, failed);
                     Directory.Move(_restoreKeep, _restoreDir);
@@ -434,12 +510,67 @@ namespace GMSCoop
             _restoreDir = _restoreKeep = null;
         }
 
+        // ================================================================= declined copies (host, local file)
+
+        // One line per copy the host declined with [N]: worldId|solo|baseRevision|revision|localId|name.
+        // The same copy (same player, world, fork point, revision not higher) is not offered again; a copy the
+        // player saved again since (higher revision) is. Matched by LocalId (Steam id; random on LAN) or name.
+        private const int MaxDeclines = 200;
+
+        private static string DeclinedPath =>
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "GMSCoop", "declined_copies.txt");
+
+        private static string CleanField(string s) => (s ?? "").Replace('|', '_').Replace('\n', ' ').Replace('\r', ' ');
+
+        private static bool WasDeclined(string worldId, bool solo, int baseRev, int rev, ulong localId, string name)
+        {
+            try
+            {
+                string path = DeclinedPath;
+                if (!File.Exists(path)) return false;
+                string inv(int v) => v.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                string cleanName = CleanField(name);
+                foreach (string line in File.ReadAllLines(path, System.Text.Encoding.UTF8))
+                {
+                    string[] f = line.Split('|');
+                    if (f.Length < 6 || f[0] != worldId || f[1] != (solo ? "1" : "0") || f[2] != inv(baseRev)) continue;
+                    if (!int.TryParse(f[3], System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out int declinedRev) ||
+                        rev > declinedRev) continue; // saved again since: offered again
+                    bool samePlayer = (localId != 0 && f[4] == localId.ToString(System.Globalization.CultureInfo.InvariantCulture)) ||
+                                      (cleanName.Length > 0 && f[5] == cleanName);
+                    if (samePlayer) return true;
+                }
+            }
+            catch (Exception ex) { Plugin.Log.LogWarning("World check: could not read declined copies: " + ex.Message); }
+            return false;
+        }
+
+        private static void RememberDecline()
+        {
+            if (string.IsNullOrEmpty(_offerWorld)) return;
+            try
+            {
+                string path = DeclinedPath;
+                Directory.CreateDirectory(Path.GetDirectoryName(path));
+                var lines = new List<string>();
+                if (File.Exists(path)) lines.AddRange(File.ReadAllLines(path, System.Text.Encoding.UTF8));
+                var inv = System.Globalization.CultureInfo.InvariantCulture;
+                lines.Add(string.Join("|", CleanField(_offerWorld), _offerSolo ? "1" : "0", _offerBase.ToString(inv),
+                                      _offerRev.ToString(inv), _offerLocalId.ToString(inv), CleanField(_offerName)));
+                if (lines.Count > MaxDeclines) lines.RemoveRange(0, lines.Count - MaxDeclines);
+                File.WriteAllLines(path, lines, new System.Text.UTF8Encoding(false));
+            }
+            catch (Exception ex) { Plugin.Log.LogWarning("World check: could not remember the declined copy: " + ex.Message); }
+        }
+
         internal static void AppendOverlay(System.Text.StringBuilder sb)
         {
             if (!_prompt) return;
-            sb.Append("\n<color=#FFE14C><b>").Append(_offerName).Append("</b> tiene una versión más nueva de este mundo (guardada ")
+            sb.Append("\n<color=#FFE14C><b>").Append(_offerName).Append(_offerConflict
+                    ? "</b> y tú jugaron este mundo por separado: las dos versiones son distintas (la suya, guardada "
+                    : "</b> tiene una versión más nueva de este mundo (guardada ")
               .Append(WorldIdentity.Friendly(_offerSaved)).Append(", rev ").Append(_offerRev).Append(" vs ").Append(_ownRev)
-              .Append(").  [U] Usar la suya   [N] Seguir con la mía  (el juego espera tu elección)</color>");
+              .Append(").  [U] Usar la suya (la tuya se guarda aparte)   [N] Seguir con la mía  (el juego espera tu elección)</color>");
         }
 
         internal static MemoryStream Begin(byte sub, out BinaryWriter w)
