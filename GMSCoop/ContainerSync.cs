@@ -1018,6 +1018,26 @@ namespace GMSCoop
             }
         }
 
+        /// <summary>
+        /// Start of game code that replays ANOTHER player's action here for show only (a bucket poured by a
+        /// remote attach): contents changes inside are undone by EndShowOnly and stock changes skipped. The
+        /// acting player's PC makes the real change (its deltas / the host's state bring it), so the material
+        /// moves once. Null = nothing to wrap.
+        /// </summary>
+        internal static object BeginShowOnly(Component owner)
+        {
+            if (owner == null || !GoldSync.Synced() || All.Count == 0) return null;
+            WrapSet set = Near(owner);
+            FillNear(set, owner);
+            for (int i = 0; i < set.Entries.Count; i++)
+                if (Alive(set.Entries[i])) Read(set.Entries[i], set.Saved[i]);
+            GoldSync.SuppressDepth++;
+            ForeignDepth++;
+            return set;
+        }
+
+        internal static void EndShowOnly(object set) => EndWrap(set as WrapSet);
+
         /// <summary>World processing of every non-holdable container type, plus processors without own contents.</summary>
         [HarmonyPatch]
         private static class PatchProcessing

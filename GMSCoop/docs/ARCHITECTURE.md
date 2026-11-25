@@ -68,6 +68,7 @@ Wire protocol: **12** (`Net.Protocol`, plugin version 0.13.0, launcher 0.13.0). 
 | Player and world | `GoldSync.cs` (ledger, clock, seasons, workers, statistics) | 14 |
 | Player and world | `ContainerSync.cs`, `DirtSync.cs`, `WorldSync.cs`, `FuelSync.cs` | 14 subs |
 | Player and world | `SessionLifecycle.cs` (game settings snapshot and restore) | none |
+| Player and world | `ExclusiveUse.cs` (what another player holds or just put into / took out of a holder cannot be picked, stacked, attached to or used here; "Lo tiene NOMBRE"; a bucket poured by a remote attach is shown only and not handed to the local player) | none |
 | Player and world | `InteractionGuard.cs` (never leaves the local player locked by an interaction another player broke: shovel holders, separator, machine enter / exit, gold panning, ladders, long input blocks) | none |
 | Player and world | `CashSync.cs` (legacy shim) | 5 |
 
@@ -95,7 +96,7 @@ The first byte of every packet is the `Msg` id. For ids 7, 10, 12, 13 and 14, th
 | 7 | Tutorial | R | yes, except 3 / 4 | full (`SendFullState`) | 1 StepState, 2 MissionState, 3 StepRequest (to the host only), 4 MissionRequest (to the host only), 5 CondMet |
 | 8 | SaveChunk | R | never | none | host to one client |
 | 9 | SaveControl | R | never | none | 1 Preparing, 2 Loaded, 3 Resend, 4 Failed, 5 CatchUp |
-| 10 | Purchase | R | yes | PurchaseSync journal (dedup by origin + seq) | 1 Spawn, 2 RentBuyout, 3 RentReturn, 4 Lot, 5 Tabs, 6 Worker, 7 Sell, 8 ParcelReset |
+| 10 | Purchase | R | yes | PurchaseSync journal (dedup by origin + seq) | 1 Spawn, 2 RentBuyout, 3 RentReturn, 4 Lot, 5 Tabs, 6 Worker, 7 Sell, 8 ParcelReset, 9 Move (depot move of a non-vehicle). A client's Spawn of a shop / vehicle purchase waits until the host accepted its cash-checked payment (refused: the local objects are destroyed, nothing is sent) |
 | 11 | MachineParts | U / R | yes | world journal (R only) | |
 | 12 | Objects | U / R | yes, except 9 | full (key-sync dump, pushed on `Loaded`) and journal (sub 4) | 0 Grab, 2 Drop, 4 Passenger, 5 Poses (U), 6 Rest, 7 Claim, 8 Attach, 9 SyncReq (to the host only), 10 Sync (host to one client), 11 StackOp, 12 Destroy, 13 Create, 14 Adopt, 15 Rope. Stamps of Poses / Drop / Rest are f64 (protocol 9): Poses header 19 bytes, then about 45 bytes per object (key length + 30), at most 1150 bytes per packet. |
 | 13 | Bed | R | yes | world journal | 0 Freeze, 1 Unfreeze, 2 Request |
@@ -108,7 +109,7 @@ The first byte of every packet is the `Msg` id. For ids 7, 10, 12, 13 and 14, th
 
 | Sub | Use |
 |---|---|
-| 0 | ledger delta (to the host only). A frame that spends gold / diamonds / magnetite, and a loan operation, travel alone; the host refuses such a delta whole when its balance no longer covers it (`Predict.Overdraws`): acknowledged without applying, sub 26 first |
+| 0 | ledger delta (to the host only). A frame that spends gold / diamonds / magnetite, a loan operation, and a client's shop / vehicle purchase (marker op 0 = cash check), travel alone; the host refuses such a delta whole when its balance no longer covers it (`Predict.Overdraws`): acknowledged without applying, sub 26 first |
 | 1 | ledger state |
 | 2 | container delta (to the host only) |
 | 3 | container state |
@@ -328,7 +329,8 @@ Below, a dash in the "Pre / Post" column means the patch has no prefix or no pos
 | GoldSync | `PatchStockSetters` | `Gsm.SetCash` / `SetGold` / `SetDiamonds` / `SetMagnetide`, `SumofGoldNuggets` setter | prefix (skip) | stock changes only through the ledger |
 | GoldSync | `PatchHostOnly` | `Finance.CollectDailyData`, `SeasonController.EndSeasonAndGoToNext`, `SeasonRestoreGold.Submit`, `MachineController.WorkerRefuel`, `LaptopGlobalManager.Start` / `AfterDeserialize`, chest / new-save effects | prefix / finalizer | the host's economy code |
 | GoldSync | `PatchRandomEvents` | `RandomEvents.InvokeRandomEvent` | prefix (skip) | host only |
-| GoldSync | `PatchCollectSalary` | `Worker.CollectSalary` | prefix (skip) | the host pays |
+| GoldSync | `PatchCollectSalary` | `Worker.CollectSalary` | prefix (skip) | the host pays; an unpaid worker's departure is deferred (game bug: list changed inside the payday foreach paid again) |
+| GoldSync | `PatchWorkersUpdate` | `WorkersManager.Update` | - / finalizer | removes the deferred departures |
 | GoldSync | `PatchSeasonEnd` | `SeasonController.EndSeasonAndGoToNext` | prefix / postfix | a shared season end |
 | GoldSync | `PatchRemelt` | `BlacksmithCraftGUI.StartGoldRemelt` | prefix / finalizer | client: the smelting spend travels alone; refused by the host, the remelt is cancelled |
 | GoldSync | `PatchForgeUpgrade` | `BlacksmithUpgradeGUI.Upgrade` | prefix / finalizer | client: the magnetite spend travels alone; refused, the level goes back |
@@ -344,7 +346,7 @@ Below, a dash in the "Pre / Post" column means the patch has no prefix or no pos
 | MachineSync | `PatchSaveMeAdd` | `CheckPointManagerBase.Add` | - / postfix | index new machines |
 | MachineSync | `PatchSaveMeRemove` | `CheckPointManagerBase.Remove` | prefix | unregister |
 | MachineSync | `PatchTrailerConnect` | `Trailer.Connect` | - / postfix | hitch sync |
-| MachineSync | `PatchTrailerDisconnect` | `Trailer.Disconnect`, `DisconnectInstantly` | prefix | unhitch sync |
+| MachineSync | `PatchTrailerDisconnect` | `Trailer.Disconnect`, `DisconnectInstantly` | prefix (skip) | unhitch sync; a second unhitch inside Disconnect's 1 s coroutine is skipped (levers flipped back) |
 | MachineSync | `PatchTeleport` | every vehicle and trailer `Teleport(Vector3, Quaternion, DepotPlace)` | prefix (skip) / postfix | teleport sync; refused for a remote-driven machine |
 | MachineSync | `PatchSanityCheck` | `MachineController.SanityCheck` | prefix (skip) | not on remote-driven machines |
 | MachineSync | `PatchMachineUpdateKinematic` | `MachineController.Update` | - / postfix | remote bodies stay kinematic |
@@ -366,7 +368,13 @@ Below, a dash in the "Pre / Post" column means the patch has no prefix or no pos
 | InteractionGuard | `PatchVehicleTransition` | `EnterVehicleController.CycleToCameras` / `CycleCamerasOut` / `InterpolateCameraToPath` | - / postfix (wrap) | watchdog: a killed enter / exit animation ends in free walk, input free |
 | InteractionGuard | `PatchRemotePanAttach` | `GoldPan.Attach` | prefix (skip) | a remote pan attach does not start the local panning view |
 | InteractionGuard | `PatchPickRemotePanning` | `GravityGun.PickOutlinedObject` | prefix (skip) | no grabbing the pan / tub another player pans with |
-| ObjectSync | `PatchGravityGunPick` | `GravityGun.PickOutlinedObject` | prefix (skip) | no grabbing what another player holds |
+| ObjectSync | `PatchGravityGunPick` | `GravityGun.PickOutlinedObject` | prefix (skip) | no grabbing what another player holds or just used (ExclusiveUse.Refuse) |
+| ExclusiveUse | `PatchGravityGunUpdate` | `GravityGun.Update` | prefix / finalizer | an action press on a target another player holds / uses is swallowed (hint) |
+| ExclusiveUse | `PatchButtonDown` | `InputManager.GetButtonDown(string)` | prefix (skip) | reads false while swallowed |
+| ExclusiveUse | `PatchSeparatorAttach` / `PatchSeparatorEnd` | `BucketHolderMagnetiteSeparator.AddContentFromBucket` / `OnAnimationEnd` | prefix / finalizer | remote pour: no pick, no claim at its end |
+| ExclusiveUse | `PatchPickDuringRemoteEnd` | `GravityGun.PickObject(GameObject, bool)` | prefix (skip) | same |
+| ExclusiveUse | `PatchFillOutStep` | `Bucket.FillOutCorutine` MoveNext | prefix / finalizer | remote pour is show only (ContainerSync.BeginShowOnly) |
+| ExclusiveUse | `PatchPanFillShowOnly` | `GoldPan.FillIn` | prefix (skip) | no pan particles from a remote pour |
 | ObjectSync | `PatchToolGunPick` | `ToolGun.PickOutlinedObject` | prefix (skip) | same |
 | PassengerSync | `PatchFixedUpdate` | `MachineController.FixedUpdate` | prefix | passenger: `IsDriven` off |
 | PassengerSync | `PatchUpdate` | `MachineController.Update` | prefix / postfix | passenger: no handbrake or operator mode |
@@ -380,12 +388,15 @@ Below, a dash in the "Pre / Post" column means the patch has no prefix or no pos
 | PurchaseSync | `PatchTrailerCoroutines` | `CashRegisterGUI.SpawnTrailer` / `TrailerSpawner.SpawnTrailer` MoveNext | prefix / postfix / finalizer | trailer purchase |
 | PurchaseSync | `PatchCarBuyObject` | `CashRegisterCarGUI.BuyObject` MoveNext | prefix / postfix / finalizer | vehicle purchase |
 | PurchaseSync | `PatchDepotTeleport` | `Depot.Teleport` | prefix | context |
-| PurchaseSync | `PatchPlaceTransport` | `DepotPlace.TransportGameObject` | prefix | context, reset moves |
+| PurchaseSync | `PatchPlaceTransport` | `DepotPlace.TransportGameObject` | prefix | context, reset moves, depot moves of non-vehicles (Kind.Move) |
 | PurchaseSync | `PatchParcelReset` | `BankParcelGUI.ResetConfirm` | prefix / postfix / finalizer | parcel reset |
 | PurchaseSync | `PatchBuyoutBuy` | `BuyoutRentedShopItemGUI.OnBuyButtonClicked` | prefix / postfix | rental buyout |
 | PurchaseSync | `PatchBuyoutSell` | `BuyoutRentedShopItemGUI.OnSellButtonClicked` | prefix | rental return |
 | PurchaseSync | `PatchDailyRentalReturn` | `Finance.ReturnMachine` | prefix (skip) | host's daily rental return reaches the clients |
 | PurchaseSync | `PatchSellObjects` | `SellGUI.SellObjects` | prefix / postfix | sales |
+| PurchaseSync | `PatchSellZoneBuyout` | `SellGUI.BuyObjects` | prefix / postfix | rental buyout in the sell zone (RentBuyout) |
+| PurchaseSync | `PatchDeliverySpawn` | `TransactionHistoryItem.SpawnDelayed` MoveNext | prefix / postfix | laptop deliveries |
+| PurchaseSync | `PatchBuyObjects` | `CashRegisterGUI.BuyObjects`, `CashRegisterCarGUI.BuyObjects` | prefix / finalizer | client: cash-checked payment; spawns held until the host accepts |
 | PurchaseSync | `PatchWorkersHire` | `WorkersToHire.Hire`, `LaptopWorkersHire.HireWorker` | prefix / postfix | hired workers |
 | SaveTransfer | `QuickSavePatch` | `CheckpointManager.QuickSave` | prefix (skip) | redirect or skip saves |
 | SaveTransfer | `RequestLoadPatch` | `CheckpointManager.RequestLoad` | prefix (skip) | refuse stale loads, leave on an own load |

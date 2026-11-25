@@ -156,6 +156,9 @@ namespace GMSCoop
             public float RemoteClaimAt;
             public ulong HeldBy;       // remote holder (grab-blocking), 0 = none
             public float HeldUpdate;
+            public ulong UsedBy;       // remote player that just put it into / took it out of a holder
+            public float UsedUntil;    // its holder may still run that player's animation until then (ExclusiveUse)
+            public float DropAt;       // when the last remote Drop arrived (DropFrom = who)
 
             // Owner side
             public bool Streaming, NeedRest;
@@ -548,6 +551,35 @@ namespace GMSCoop
         }
 
         /// <summary>
+        /// A game script replaying another player's action here moved <paramref name="go"/> in or out of a holder
+        /// (the separator animation ending): that player's PC announces it, this PC must not claim it for that.
+        /// </summary>
+        internal static void AcceptLocalHolderChange(GameObject go)
+        {
+            Entry e = EntryOf(go);
+            if (e != null && e.Owner != Net.LocalId) e.SentHolder = CurrentHolder(e);
+        }
+
+        /// <summary>
+        /// ExclusiveUse: the remote player that holds <paramref name="go"/> or what it hangs on (a holder on a
+        /// carried bucket, a tool-use collider below it, ...), or that put it into / took it out of a holder in the
+        /// last seconds (the holder may still run that player's animation). 0 = free for the local player.
+        /// </summary>
+        internal static ulong RemoteUserOf(GameObject go)
+        {
+            if (go == null || !Ready) return 0;
+            float now = Time.unscaledTime;
+            for (Transform t = go.transform; t != null; t = t.parent)
+            {
+                Entry e = EntryOf(t.gameObject);
+                if (e == null) continue;
+                if (e.HeldBy != 0 && e.HeldBy != Net.LocalId) return e.HeldBy;
+                if (e.UsedBy != 0 && e.UsedBy != Net.LocalId && now < e.UsedUntil) return e.UsedBy;
+            }
+            return 0;
+        }
+
+        /// <summary>
         /// True if loose sync leaves this object alone: frozen in a truck bed (BedSync), inactive
         /// (TransportBed deactivates cargo; unloaded streamed area) or suppressed explicitly.
         /// </summary>
@@ -791,8 +823,11 @@ namespace GMSCoop
                 Owned.Remove(e);
                 if (_localEntry == e)
                 {
+                    // Both players picked it within the same latency window: the claim tie-break (epoch, then
+                    // the lower LocalId) is the single arbiter every PC agrees on; the loser lets go here.
                     Plugin.Log.LogInfo($"Object sync: lost {e.Key} to {Net.NameOf(who)}");
                     ForceLocalDrop(e.Go);
+                    if (who != 0) ExclusiveUse.Hint(who, force: true);
                 }
             }
             e.Owner = who;
@@ -1004,6 +1039,7 @@ namespace GMSCoop
                 if (e != _localEntry) _sendList.Add(e);
             }
             int n = _sendList.Count;
+            Transform heldTr = _localHeld != null ? _localHeld.transform : null;
             int fixedHead = n > 0 && _sendList[0] == _localEntry ? 1 : 0;
             int span = n - fixedHead;
             int rot0 = span > 0 ? _sendRot % span : 0;
@@ -1014,7 +1050,9 @@ namespace GMSCoop
                 if (IsSuppressed(e.Go)) continue; // frozen on a bed / unloaded area: nothing to show
                 CheckHolder(e);
                 Rigidbody rb = e.Rb;
-                bool held = e == _localEntry;
+                // Items carried in the local player's MultiHolder (moss mats, grilles: parented under the carrier,
+                // which has no key of its own) count as held too, so nobody else picks them out one by one.
+                bool held = e == _localEntry || (heldTr != null && e.Go != _localHeld && e.Go.transform.IsChildOf(heldTr));
                 if (!held && e.Attached)
                 {
                     // Rides on its holder (joint); MachineSync / the holder carry it. Nothing to stream.
@@ -2293,7 +2331,15 @@ namespace GMSCoop
             if (sender == Net.LocalId || e == null || !Valid(ref check)) return;
             if (Frozen(e)) { Accept(e, sender, epoch); return; } // bed cargo: BedSync
             if (!Accept(e, sender, epoch)) return;
+            // The holder may run that player's animation / input block for a moment (separator, hog pan box,
+            // shovel holder): nobody else takes the item meanwhile (ExclusiveUse). Only when the player put it
+            // there from the hand (held, or dropped just before the attach); a script's automatic holder change
+            // reserves it only briefly.
+            float nowA = Time.unscaledTime;
+            bool byHand = e.HeldBy == sender || (e.DropFrom == sender && nowA - e.DropAt < 1.5f);
             if (e.HeldBy != 0) { e.HeldBy = 0; Held.Remove(e); }
+            e.UsedBy = sender;
+            e.UsedUntil = nowA + (byHand ? ExclusiveUse.AttachBusy : ExclusiveUse.AutoBusy);
             if (attached) ApplyAttach(e, ResolveHolder(hr), kinematic, check.Pos, check.Rot, epoch);
             else ApplyDetach(e, kinematic, check.Pos, check.Rot);
         }
@@ -2571,6 +2617,7 @@ namespace GMSCoop
             Entry e = Lookup(key);
             if (holder == Net.LocalId || e == null) return;
             if (e.HeldBy == holder) { e.HeldBy = 0; Held.Remove(e); }
+            e.DropAt = Time.unscaledTime;
             // Held poses of this epoch still in flight on the unreliable channel are older than this Drop.
             e.DropFrom = holder;
             e.DropEpoch = epoch;
@@ -2630,6 +2677,12 @@ namespace GMSCoop
                     e.HeldBy = sender;
                     e.HeldUpdate = now;
                     Held.Add(e);
+                }
+                else if (!held && newest && e.HeldBy == sender)
+                {
+                    // Let go without a Drop of its own (a mat dropped from the sender's MultiHolder).
+                    e.HeldBy = 0;
+                    Held.Remove(e);
                 }
                 DetachIfAttached(e);
                 StartFollow(e);
@@ -3794,7 +3847,8 @@ namespace GMSCoop
 
             private static bool Prefix(GravityGun __instance)
             {
-                return !(Net.Active && IsRemotelyHeld(__instance.ObjectHit));
+                // Game scripts pick for the local player too (PickObject): the same rule, with the hint.
+                return !(Net.Active && !ApplyingHolderChange && ExclusiveUse.Refuse(__instance.ObjectHit));
             }
         }
 
@@ -3814,7 +3868,7 @@ namespace GMSCoop
 
             private static bool Prefix(ToolGun __instance)
             {
-                return !(Net.Active && IsRemotelyHeld(__instance.ObjectHit));
+                return !(Net.Active && !ApplyingHolderChange && ExclusiveUse.Refuse(__instance.ObjectHit));
             }
         }
 

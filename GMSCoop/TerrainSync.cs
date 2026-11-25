@@ -150,6 +150,53 @@ namespace GMSCoop
             }
         }
 
+        private static readonly List<BoxCollider> _noDig = new List<BoxCollider>();
+        private static readonly Collider[] _noDigHits = new Collider[32];
+        private static int _noDigMask = -2;
+
+        /// <summary>
+        /// The machines' / trailers' no-dig volumes (CantDigUnderMachine, layer NoColisions, as GoldTerrainDigger
+        /// .AddVolumeDirt finds them) over heightmap cells x..x+w, y..y+h of the tile. False if there are none.
+        /// </summary>
+        private static bool CollectNoDigZones(Info info, int x, int y, int w, int h)
+        {
+            _noDig.Clear();
+            if (_noDigMask == -2) _noDigMask = LayerMask.GetMask("NoColisions");
+            if (_noDigMask == 0) return false;
+            TerrainData d = info.D;
+            Vector3 o = info.T.GetPosition(), size = d.size;
+            int res = d.heightmapResolution;
+            float sx = size.x / (res - 1), sz = size.z / (res - 1);
+            var min = new Vector3(o.x + x * sx, o.y - 10f, o.z + y * sz);
+            var max = new Vector3(o.x + (x + w - 1) * sx, o.y + size.y + 10f, o.z + (y + h - 1) * sz);
+            Vector3 half = (max - min) * 0.5f + new Vector3(1f, 0f, 1f);
+            int n = Physics.OverlapBoxNonAlloc((min + max) * 0.5f, half, _noDigHits, Quaternion.identity, _noDigMask, QueryTriggerInteraction.Collide);
+            for (int i = 0; i < n; i++)
+            {
+                Collider col = _noDigHits[i];
+                _noDigHits[i] = null;
+                if (col == null || !col.enabled) continue;
+                CantDigUnderMachine cd = col.GetComponent<CantDigUnderMachine>();
+                if (cd == null || !cd.isActiveAndEnabled || cd.BlockingVolume == null) continue;
+                if (!_noDig.Contains(cd.BlockingVolume)) _noDig.Add(cd.BlockingVolume);
+            }
+            return _noDig.Count > 0;
+        }
+
+        /// <summary>World x/z inside one of the collected no-dig volumes (their footprint, height ignored).</summary>
+        private static bool InNoDigZone(float wx, float wz)
+        {
+            foreach (BoxCollider b in _noDig)
+            {
+                if (b == null) continue;
+                Transform t = b.transform;
+                Vector3 l = t.InverseTransformPoint(new Vector3(wx, t.TransformPoint(b.center).y, wz)) - b.center;
+                // Footprint in the box's own x/z (as the game's rectangle: right / forward axes of the volume).
+                if (Mathf.Abs(l.x) <= b.size.x * 0.5f && Mathf.Abs(l.z) <= b.size.z * 0.5f) return true;
+            }
+            return false;
+        }
+
         /// <summary>Adds a remote height write (heightmap cells x..x+w, y..y+h, new values) to the tile's edited world area.</summary>
         private static void AddEditArea(Info info, int x, int y, int w, int h, float[,] arr)
         {
@@ -379,6 +426,25 @@ namespace GMSCoop
         }
 
         private static bool HasPendingFor(int kx, int kz) => Pending.Count > 0 && Pending.ContainsKey(Key(kx, kz));
+
+        /// <summary>
+        /// True if another player's edits still wait for a loaded tile that covers <paramref name="p"/> (x/z): its
+        /// heights are not final yet (a freshly loaded area shows its saved surface until RetryPending ran).
+        /// </summary>
+        internal static bool HasPendingAt(Vector3 p)
+        {
+            if (Pending.Count == 0) return false;
+            Terrain[] terrains = Terrain.activeTerrains;
+            if (terrains == null) return false;
+            foreach (Terrain t in terrains)
+            {
+                if (t == null || t.terrainData == null) continue;
+                Vector3 o = t.GetPosition(), size = t.terrainData.size;
+                if (p.x < o.x || p.z < o.z || p.x > o.x + size.x || p.z > o.z + size.z) continue;
+                if (Pending.ContainsKey(Key(Mathf.RoundToInt(o.x), Mathf.RoundToInt(o.z)))) return true;
+            }
+            return false;
+        }
 
         private static void Pend(byte[] raw)
         {
@@ -1458,6 +1524,9 @@ namespace GMSCoop
                     byte[] lo = br.ReadBytes(count), hi = br.ReadBytes(count);
                     if (hi.Length != count) return false;
                     float[,] arr = d.GetHeights(x, y, w, h);
+                    bool zones = check && CollectNoDigZones(info, x, y, w, h);
+                    Vector3 to = info.T.GetPosition();
+                    float csx = d.size.x / (resX - 1), csz = d.size.z / (resX - 1);
                     ushort prev = 0;
                     int c = 0;
                     for (int i = 0; i < h; i++)
@@ -1472,8 +1541,19 @@ namespace GMSCoop
                                 skipped++;
                                 continue;
                             }
-                            arr[i, j] = prev / 65535f;
+                            float nv = prev / 65535f;
+                            // Never raise the ground under a machine / trailer here (the game's own rule for local
+                            // dumps, CantDigUnderMachine): another player's dump, made where that machine stood a bit
+                            // elsewhere on their PC (or with a tool that ignores the rule), buried parked machines.
+                            if (zones && nv > arr[i, j] + 1e-5f && InNoDigZone(to.x + (x + j) * csx, to.z + (y + i) * csz))
+                            {
+                                mask[i * w + j] = false;
+                                skipped++;
+                                continue;
+                            }
+                            arr[i, j] = nv;
                         }
+                    _noDig.Clear();
                     if (skipped < count)
                     {
                         d.SetHeightsDelayLOD(x, y, arr);

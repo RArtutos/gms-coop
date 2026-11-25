@@ -351,7 +351,7 @@ namespace GMSCoop
         {
             public Rigidbody Rb;
             public RigidbodyConstraints Prev;
-            public Vector3 V, W;
+            public Vector3 V, W, P;
             public int Owners;
         }
 
@@ -359,7 +359,7 @@ namespace GMSCoop
         {
             public AreaStreamer Area;
             public string Scene;
-            public float Started, NextScan;
+            public float Started, ActivatedAt, NextScan;
             public bool Activated, UnpauseSeen, PausedForPlayer;
             public int ActivatedFrame, ClearFrame = -1;
             public readonly List<Rect> Rects = new List<Rect>();
@@ -380,9 +380,12 @@ namespace GMSCoop
         private static void BeginWindow(AreaStreamer area)
         {
             if (FindWindow(area.sceneName) != null) return;
+            // Nothing is frozen before the activation: the scene only integrates in the background until then
+            // (seconds with a low loading priority) and nothing changes for the bodies already in the world;
+            // freezing them that early only made the objects around the player (who is in the trigger box)
+            // stick in the air. OnSceneLoaded freezes before the first physics step with the new scene.
             var w = new Window { Area = area, Scene = area.sceneName, Started = Time.realtimeSinceStartup };
             Windows.Add(w);
-            Scan(w);
         }
 
         private static void OnSceneLoaded(Scene scene, LoadSceneMode mode)
@@ -393,6 +396,8 @@ namespace GMSCoop
                 if (w == null || w.Activated) return;
                 w.Activated = true;
                 w.ActivatedFrame = Time.frameCount;
+                w.ActivatedAt = Time.realtimeSinceStartup;
+                RefreshTowed();
                 foreach (GameObject root in scene.GetRootGameObjects())
                 {
                     foreach (Terrain t in root.GetComponentsInChildren<Terrain>(true))
@@ -427,18 +432,80 @@ namespace GMSCoop
             return false;
         }
 
-        /// <summary>Freezes every loose non-kinematic body inside the area's boxes or on its new tiles.</summary>
+        /// <summary>
+        /// Freezes every loose non-kinematic body inside the area's boxes or on its new tiles, except what moves
+        /// with the local player: anything in / on / right around him or his machine and trailer (cargo lying
+        /// in the bed of the truck he drives: frozen in world space, the truck drove away from it and it fell
+        /// on the road), bodies in motion off the new tiles (towed, rolling, carried: their ground is the old
+        /// one, which does not change) and jointed bodies (a rope hook must not be half frozen).
+        /// </summary>
         private static void Scan(Window w)
         {
             w.NextScan = Time.realtimeSinceStartup + 0.25f;
-            ReleasePicked(w);
-            if (w.Area == null) return;
+            bool riding = RidingBounds(out Bounds ride);
+            RefreshTowed();
+            ReleasePicked(w, riding, ride);
+            if (w.Area == null || !w.Activated) return;
             foreach (Rigidbody rb in UnityEngine.Object.FindObjectsOfType<Rigidbody>())
             {
                 if (rb == null || rb.isKinematic || !rb.detectCollisions || w.Mine.Contains(rb.GetInstanceID())) continue;
                 Vector3 p = rb.position;
-                if (Distance(w.Area.LoadBounds, p) <= 0f || OnNewTerrain(w, p, 2f)) FreezeUnit(w, rb);
+                bool onNew = OnNewTerrain(w, p, 2f);
+                if (!onNew && Distance(w.Area.LoadBounds, p) > 0f) continue;
+                if (riding && ride.Contains(p)) continue;
+                if (!onNew && rb.velocity.sqrMagnitude > 0.25f) continue;
+                FreezeUnit(w, rb); // skips towed / jointed units
             }
+        }
+
+        // Units (machine / trailer root, else the body's own object) joined to ANOTHER unit by a joint: rope hooks
+        // and the objects / machines they tow, hitched trailers, chains of rope pieces. Never frozen (freezing one
+        // end held the other: rope stretched, truck stuck); rebuilt every scan, frozen ones that got jointed since
+        // are released. Joints inside one machine (arms, wheels) do not count.
+        private static readonly HashSet<GameObject> Towed = new HashSet<GameObject>();
+
+        private static GameObject UnitRoot(Rigidbody rb)
+        {
+            Component unit = (Component)rb.GetComponentInParent<MachineController>() ?? rb.GetComponentInParent<Trailer>();
+            return unit != null ? unit.gameObject : rb.gameObject;
+        }
+
+        private static void RefreshTowed()
+        {
+            Towed.Clear();
+            foreach (Joint j in UnityEngine.Object.FindObjectsOfType<Joint>())
+            {
+                if (j == null || j.connectedBody == null) continue;
+                Rigidbody a = j.GetComponent<Rigidbody>();
+                if (a == null) continue;
+                GameObject ra = UnitRoot(a), rb = UnitRoot(j.connectedBody);
+                if (ra == rb) continue;
+                Towed.Add(ra);
+                Towed.Add(rb);
+            }
+        }
+
+        /// <summary>World box around the local player and, when he drives, his machine and its trailer (grown by 1.5 m).</summary>
+        private static bool RidingBounds(out Bounds b)
+        {
+            b = default;
+            Player p = LocalPlayer();
+            if (p == null) return false;
+            b = new Bounds(p.transform.position + Vector3.up, new Vector3(2f, 3f, 2f));
+            MachineController cm = p.GetControlledMachine();
+            if (cm != null)
+            {
+                AddColliders(ref b, cm.gameObject);
+                if (cm is Pickup pk && pk.ConnectedTrailer != null) AddColliders(ref b, pk.ConnectedTrailer.gameObject);
+            }
+            b.Expand(3f);
+            return true;
+        }
+
+        private static void AddColliders(ref Bounds b, GameObject go)
+        {
+            foreach (Collider c in go.GetComponentsInChildren<Collider>())
+                if (c != null && c.enabled && !c.isTrigger) b.Encapsulate(c.bounds);
         }
 
         /// <summary>A machine / trailer is frozen as a whole (never half of a jointed body).</summary>
@@ -446,6 +513,7 @@ namespace GMSCoop
         {
             if (rb == null) return;
             Component unit = (Component)rb.GetComponentInParent<MachineController>() ?? rb.GetComponentInParent<Trailer>();
+            if (Towed.Contains(unit != null ? unit.gameObject : rb.gameObject)) return;
             if (unit != null)
             {
                 if (IsPlayerUnit(unit.gameObject)) return;
@@ -495,7 +563,7 @@ namespace GMSCoop
             int id = rb.GetInstanceID();
             if (!w.Mine.Add(id)) return;
             if (Frozen.TryGetValue(id, out FrozenBody f) && f.Rb != null) { f.Owners++; return; }
-            f = new FrozenBody { Rb = rb, Prev = rb.constraints, V = rb.velocity, W = rb.angularVelocity, Owners = 1 };
+            f = new FrozenBody { Rb = rb, Prev = rb.constraints, V = rb.velocity, W = rb.angularVelocity, P = rb.position, Owners = 1 };
             Frozen[id] = f;
             rb.constraints = RigidbodyConstraints.FreezeAll;
         }
@@ -511,19 +579,29 @@ namespace GMSCoop
             rb.constraints = f.Prev;
             if (!rb.isKinematic)
             {
-                rb.velocity = f.V;
-                rb.angularVelocity = f.W;
+                // Its motion from before the freeze, unless it was moved meanwhile (a network rest pose, a
+                // ground fix, a teleport): an old velocity would throw it from its new place.
+                if ((rb.position - f.P).sqrMagnitude < 0.0025f)
+                {
+                    rb.velocity = f.V;
+                    rb.angularVelocity = f.W;
+                }
                 rb.WakeUp();
             }
         }
 
-        /// <summary>An object picked up while frozen goes back to normal physics at once.</summary>
-        private static void ReleasePicked(Window w)
+        /// <summary>
+        /// An object picked up while frozen, a machine the local player got into, or anything that now rides
+        /// with him goes back to normal physics at once.
+        /// </summary>
+        private static void ReleasePicked(Window w, bool riding, Bounds ride)
         {
             if (w.Mine.Count == 0) return;
             List<int> drop = null;
             foreach (int id in w.Mine)
-                if (Frozen.TryGetValue(id, out FrozenBody f) && f.Rb != null && IsPicked(f.Rb)) (drop ??= new List<int>()).Add(id);
+                if (Frozen.TryGetValue(id, out FrozenBody f) && f.Rb != null &&
+                    (IsPicked(f.Rb) || IsPlayerBody(f.Rb) || riding && ride.Contains(f.Rb.position) || Towed.Contains(UnitRoot(f.Rb))))
+                    (drop ??= new List<int>()).Add(id);
             if (drop == null) return;
             foreach (int id in drop)
             {
@@ -559,7 +637,10 @@ namespace GMSCoop
                 string why = null;
                 if (!ready) why = "world unloading";
                 else if (w.Area == null) why = "area gone";
-                else if (now - w.Started > 20f) why = "timeout";
+                // 20 s after the activation (bodies are frozen only from then on). Before it the scene may take
+                // long to integrate on a slow PC: closing the window then would let it activate with time running
+                // and nothing frozen (worse than the game's pause), so only a load that never ends gives up.
+                else if (w.Activated ? now - w.ActivatedAt > 20f : now - w.Started > 180f) why = "timeout";
                 else if (!w.Activated)
                 {
                     if (!w.Area.loading && !w.Area.loaded) why = "load cancelled";
@@ -653,13 +734,26 @@ namespace GMSCoop
                 FastTravelPoint ft = __instance.objectTransform.parent.GetComponent<FastTravelPoint>();
                 AreaStreamer a = ft != null ? ft.area : null;
                 if (a == null) return;
+                // One prefetch at a time: the newest selection replaces the previous one (whose hold ends with it,
+                // KeepAlive only holds _prefetch). A load already running cannot be cancelled: the new one starts
+                // once it is done (TickPrefetch), clicking through several points no longer loads them all at once.
                 _prefetch = a;
                 _prefetchUntil = Time.realtimeSinceStartup + 90f;
-                if (a.loaded || a.loading || a.unloading || !a.isActiveAndEnabled) return;
-                a.StartCoroutine(a.Load());
-                Plugin.Log.LogInfo($"World streaming: fast travel point selected, loading '{a.sceneName}' now");
+                TickPrefetch();
             }
             catch (Exception ex) { Plugin.Log.LogWarning("World streaming: fast travel prefetch: " + ex.Message); }
+        }
+
+        private static AreaStreamer _prefetchLoad; // the area whose load a prefetch started
+
+        private static void TickPrefetch()
+        {
+            AreaStreamer a = _prefetch;
+            if (a == null || a.loaded || a.loading || a.unloading || !a.isActiveAndEnabled) return;
+            if (_prefetchLoad != null && _prefetchLoad.loading) return; // the previous prefetch is still loading
+            _prefetchLoad = a;
+            a.StartCoroutine(a.Load());
+            Plugin.Log.LogInfo($"World streaming: fast travel point selected, loading '{a.sceneName}' now");
         }
 
         private static bool ForceLoadWithoutTrailerPrefix(MapMenu __instance, AreaStreamer sc, CollisionListener col, ref IEnumerator __result)
@@ -720,6 +814,9 @@ namespace GMSCoop
             if (sc == null) return true;
             if (!sc.loaded || sc.loading || sc.LoadingSubScenes > 0 || FindWindow(sc.sceneName) != null) return false;
             if (!PlayerPos(out Vector3 me)) return true;
+            // Co-op: another player's edits for the tile under the player not applied yet (the game's 4.5 s hold
+            // gave them time): the player could stand where a dirt pile appears a moment later.
+            if (TerrainSync.HasPendingAt(me)) return false;
             foreach (AreaStreamer a in AreaStreamer.Instances)
             {
                 if (a == null || Distance(a.LoadBounds, me) > 0f) continue;
@@ -756,6 +853,8 @@ namespace GMSCoop
             }
 
             RefreshPlayers(pos, now);
+            if (_prefetch != null && now > _prefetchUntil) _prefetch = null;
+            if (_prefetch != null && _quickTravel.Value) TickPrefetch();
             bool busy = AnyAreaBusy();
             UpdatePriority(areas);
             KeepAlive(areas, now);

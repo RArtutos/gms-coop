@@ -88,6 +88,13 @@ namespace GMSCoop
 
         internal static bool IsLocalPassenger => _passengerOf != null;
 
+        /// <summary>
+        /// BedSync: the local player sits in <paramref name="m"/> as a passenger and stays one when its driver's
+        /// drive ends (only a passenger who got in during the driver's exit takes the wheel).
+        /// </summary>
+        internal static bool RidesAlongIn(MachineController m) =>
+            m != null && _passengerOf != null && ReferenceEquals(m, _passengerOf) && !_takeWheel;
+
         // =====================================================================================
         // Local side
         // =====================================================================================
@@ -114,6 +121,23 @@ namespace GMSCoop
                              ((id >= 0 && MachineSync.IsRemoteDriven(id)) || ReferenceEquals(m, _passengerOf));
             if (passenger && id >= 0) _passengerId = id;
 
+            // Got in while the other player was already getting out (its exit still plays here, up to 20 s while
+            // the machine rolls on): this player meant to drive. Once that drive is released, take the wheel
+            // instead of staying a passenger until getting out and in again. If the other player gets back in
+            // first, this player rides along as a normal passenger.
+            if (_takeWheel && ReferenceEquals(m, _passengerOf) && id >= 0)
+            {
+                if (MachineSync.IsRemoteDriven(id))
+                {
+                    if (!MachineSync.RemoteExiting(id)) _takeWheel = false;
+                }
+                else
+                {
+                    End(sendState: true, takeWheel: true);
+                    return;
+                }
+            }
+
             if (passenger && !ReferenceEquals(m, _passengerOf))
             {
                 if (_passengerOf != null) End(sendState: false);
@@ -138,27 +162,42 @@ namespace GMSCoop
         {
             _passengerOf = m;
             _passengerId = id;
+            _takeWheel = id >= 0 && MachineSync.RemoteExiting(id);
             m.IsDriven = false;
             OffsetCamera(m);
             SendState(id);
-            Plugin.Log.LogInfo($"Passenger: riding in {m.gameObject.name} (#{id})");
+            Plugin.Log.LogInfo($"Passenger: riding in {m.gameObject.name} (#{id})" + (_takeWheel ? ", driving once the other player is out" : ""));
+            // Exclusive driver seat: the other player drives it (also when both got in at the same moment and the
+            // other one won), so this player rides along. Say why the wheel does not respond.
+            ulong driver = id >= 0 ? MachineSync.DriverOf(id) : 0UL;
+            if (driver != 0 && !_takeWheel && Time.unscaledTime >= _nextSeatHint)
+            {
+                _nextSeatHint = Time.unscaledTime + 5f;
+                GoldSync.ShowHint($"Lo tiene {Net.NameOf(driver)}: vas de pasajero");
+            }
         }
 
-        private static void End(bool sendState)
+        private static bool _takeWheel;    // got in while the remote driver was getting out: drive once it is out
+        private static float _nextSeatHint;
+
+        private static void End(bool sendState, bool takeWheel = false)
         {
             MachineController m = _passengerOf;
             _passengerOf = null;
             _passengerId = -1;
+            _takeWheel = false;
             if (sendState) SendState(-1);
 
             // The session ended while seated as a passenger: alone in this world now, take over as the driver.
-            if (m != null && !Net.Active && m.IsControlled() && m.EnterVehicle != null)
+            // Or got in while the other player was getting out: its drive is over, take the wheel.
+            if (m != null && (!Net.Active || takeWheel) && m.IsControlled() && m.EnterVehicle != null)
             {
                 // Like EnterVehicleController.SetPlayerState: in an operator cab the player operates (IsOperated), not drives.
                 m.IsDriven = InOperatorCabin == null || !InOperatorCabin(m.EnterVehicle);
                 if (m.EnterVehicle.MyPlayerState == PlayerState.InMachineCabin) m.EnterVehicle.SetCameraScripts();
                 m.StartCoroutine(m.EnterVehicle.UpdateWorkerPerson());
-                Plugin.Log.LogInfo($"Passenger: remote driver left {m.gameObject.name}, you are driving now (session ended)");
+                Plugin.Log.LogInfo($"Passenger: remote driver left {m.gameObject.name}, you are driving now" +
+                                   (Net.Active ? "" : " (session ended)"));
             }
             else if (m != null)
             {

@@ -55,6 +55,7 @@ namespace GMSCoop
             Worker = 6,
             Sell = 7,
             ParcelReset = 8,
+            Move = 9,
         }
 
         // Set while applying remote data so our own patches/polls do not echo it back.
@@ -106,6 +107,9 @@ namespace GMSCoop
                 if (Applied.Count > 0) { Applied.Clear(); AppliedOrder.Clear(); }
                 Inbox.Clear();
                 Outbox.Clear();
+                PendingMoves.Clear();
+                Buys.Clear();
+                BuyOfIter.Clear();
                 // The host's journal belongs to the session that ended (absolute indexes keep growing).
                 if (_journalOn || Journal.Count > 0 || PeerStart.Count > 0)
                 {
@@ -121,6 +125,8 @@ namespace GMSCoop
             }
             // Messages that name objects wait until keys mean the same object on every PC.
             if ((Inbox.Count > 0 || Outbox.Count > 0) && ObjectSync.KeysReady) FlushQueues();
+            if (Buys.Count > 0) TickBuys();
+            if (PendingMoves.Count > 0) FlushMoves();
             if (Time.unscaledTime < _nextPoll) return;
             _nextPoll = Time.unscaledTime + 0.5f;
             if (_journalOn && Net.IsHost) Trim();
@@ -380,7 +386,7 @@ namespace GMSCoop
         private static readonly List<Inbound> Inbox = new List<Inbound>();
 
         private static bool NamesObjects(Kind k) =>
-            k == Kind.RentBuyout || k == Kind.RentReturn || k == Kind.Sell || k == Kind.ParcelReset;
+            k == Kind.RentBuyout || k == Kind.RentReturn || k == Kind.Sell || k == Kind.ParcelReset || k == Kind.Move;
 
         /// <summary>Sends now if keys are shared, else once they are (same world only). <paramref name="after"/> runs after sending.</summary>
         private static void SendNamed(Func<byte[]> build, Action after, int gen)
@@ -508,6 +514,16 @@ namespace GMSCoop
             // Streamed area the object belongs to (e.g. "Town" for shop items), so the receiver can
             // keep it frozen there if that area is not loaded on its PC.
             w.Write(AreaSceneOf(t));
+            Buy buy = _stepBuy;
+            if (buy != null && !buy.Released)
+            {
+                // The host has not accepted this purchase's money yet: the spawn waits (TickBuys), so a refused
+                // purchase leaves no object on any PC.
+                buy.Held.Add(ms.ToArray());
+                buy.Objects.Add(go);
+                Plugin.Log.LogInfo($"Purchase sync: spawn {save.SaveID} waits for the host to accept the payment");
+                return;
+            }
             Send(ms.ToArray());
             // The buyer owns the new item: its fall/settle is streamed and the exact rest pose sent,
             // so it lies at the same spot on every PC. Sent after the spawn (same reliable channel).
@@ -611,6 +627,7 @@ namespace GMSCoop
                     case Kind.Worker: ReceiveWorker(r); break;
                     case Kind.Sell: ReceiveSell(r); break;
                     case Kind.ParcelReset: ReceiveParcelReset(r); break;
+                    case Kind.Move: ReceiveMove(r); break;
                     default: Plugin.Log.LogWarning("Purchase sync: unknown kind " + kind); break;
                 }
             }
@@ -917,7 +934,9 @@ namespace GMSCoop
 
         private static bool SameWorker(Worker a, Worker b) =>
             a != null && b != null && a.Name == b.Name && a.IsMen == b.IsMen && a.Tier == b.Tier &&
-            a.ImageInfo != null && b.ImageInfo != null && a.ImageInfo == b.ImageInfo;
+            // WorkerImageInfo's == / != read both operands' fields (no null check): "x != null" threw. The
+            // null tests are reference comparisons; the field comparison runs on two real objects only.
+            !ReferenceEquals(a.ImageInfo, null) && !ReferenceEquals(b.ImageInfo, null) && a.ImageInfo == b.ImageInfo;
 
         // =====================================================================
         // Object references (existing objects)
@@ -1114,6 +1133,130 @@ namespace GMSCoop
                 "LaptopWorkersHire.HireWorker()");
         }
 
+        // ---------- purchases the host may refuse (two players buying with the same money at once) ----------
+        //
+        // A client's shop / vehicle purchase sends its money change alone, marked for a cash check
+        // (GoldSync.CheckedSpendEnd). The objects it spawns (spawn coroutines started inside BuyObjects) are
+        // shown locally at once, but their Spawn messages wait until the host answered: accepted -> sent;
+        // refused (the host's cash no longer covers it) -> the local objects are destroyed and nothing is sent,
+        // GoldSync's prediction gives the money back and the buyer sees the refusal hint.
+
+        private sealed class Buy
+        {
+            public uint Seq;
+            public bool Refused, Released;
+            public float Since;
+            public readonly List<byte[]> Held = new List<byte[]>();
+            public readonly List<GameObject> Objects = new List<GameObject>();
+        }
+
+        private static readonly List<Buy> Buys = new List<Buy>();
+        private static readonly Dictionary<object, Buy> BuyOfIter = new Dictionary<object, Buy>();
+        private static Buy _openBuy;   // inside BuyObjects: coroutines started now belong to it
+        private static Buy _stepBuy;   // inside a step of a coroutine that belongs to a purchase
+
+        private static void BuyOpen()
+        {
+            _openBuy = null;
+            if (_applying || !Net.Active || Net.IsHost || !CanSend) return;
+            GoldSync.CheckedSpendBegin();
+            _openBuy = new Buy { Since = Time.unscaledTime };
+        }
+
+        private static void BuyClose()
+        {
+            Buy b = _openBuy;
+            _openBuy = null;
+            if (b == null) return;
+            try { b.Seq = GoldSync.CheckedSpendEnd(() => b.Refused = true); }
+            catch (Exception ex) { Plugin.Log.LogWarning("Purchase sync: checked spend failed: " + ex.Message); b.Seq = 0; }
+            if (b.Seq == 0) { ReleaseBuy(b); return; } // nothing spent (no money): nothing to wait for
+            Buys.Add(b);
+        }
+
+        /// <summary>Coroutine step prefix: which purchase (if any) this iterator belongs to.</summary>
+        private static void BuyStepBegin(object iter)
+        {
+            _stepBuy = null;
+            if (iter == null) return;
+            if (_openBuy != null && !BuyOfIter.ContainsKey(iter))
+            {
+                if (BuyOfIter.Count > 256) BuyOfIter.Clear(); // coroutines stopped by the game never finish
+                BuyOfIter[iter] = _openBuy;
+            }
+            BuyOfIter.TryGetValue(iter, out _stepBuy);
+        }
+
+        private static void BuyStepEnd(object iter, bool more)
+        {
+            Buy b = _stepBuy;
+            _stepBuy = null;
+            if (iter != null && !more) BuyOfIter.Remove(iter);
+            if (b != null && b.Refused) DestroyBuyObjects(b); // spawned after the refusal arrived
+        }
+
+        private static void DestroyBuyObjects(Buy b)
+        {
+            foreach (GameObject go in b.Objects)
+                if (go != null)
+                {
+                    try { InteractionGuard.BeforeRemoteRemove(go); } catch (Exception) { }
+                    Object.Destroy(go);
+                }
+            b.Objects.Clear();
+            b.Held.Clear();
+        }
+
+        private static void ReleaseBuy(Buy b)
+        {
+            b.Released = true;
+            foreach (byte[] m in b.Held) Send(m);
+            foreach (GameObject go in b.Objects) if (go != null) ObjectSync.ClaimLocal(go);
+            b.Held.Clear();
+            b.Objects.Clear();
+        }
+
+        private static void TickBuys()
+        {
+            float now = Time.unscaledTime;
+            for (int i = Buys.Count - 1; i >= 0; i--)
+            {
+                Buy b = Buys[i];
+                if (b.Refused)
+                {
+                    if (b.Objects.Count > 0) Plugin.Log.LogInfo($"Purchase sync: purchase refused by the host, {b.Objects.Count} object(s) removed here");
+                    DestroyBuyObjects(b);
+                    // Kept while its coroutines may still spawn (BuyStepEnd removes those too).
+                    if (now - b.Since > 60f) Buys.RemoveAt(i);
+                    continue;
+                }
+                if (!b.Released && !GoldSync.SpendPending(b.Seq)) ReleaseBuy(b); // applied (or expired: the host's value rules)
+                if (b.Released && now - b.Since > 60f) Buys.RemoveAt(i);
+            }
+        }
+
+        [HarmonyPatch]
+        private static class PatchBuyObjects
+        {
+            private static IEnumerable<MethodBase> TargetMethods()
+            {
+                MethodInfo a = AccessTools.Method(typeof(CashRegisterGUI), nameof(CashRegisterGUI.BuyObjects), Type.EmptyTypes);
+                MethodInfo b = AccessTools.Method(typeof(CashRegisterCarGUI), nameof(CashRegisterCarGUI.BuyObjects), Type.EmptyTypes);
+                if (a != null) yield return a;
+                if (b != null) yield return b;
+            }
+
+            private static bool Prepare()
+            {
+                foreach (MethodBase m in TargetMethods()) return true;
+                Plugin.Log.LogWarning("Purchase sync: BuyObjects not found, the host cannot refuse a purchase paid with money another player spent");
+                return false;
+            }
+
+            private static void Prefix() => BuyOpen();
+            private static Exception Finalizer(Exception __exception) { BuyClose(); return __exception; }
+        }
+
         // ---------- shop items ----------
 
         [HarmonyPatch]
@@ -1127,8 +1270,8 @@ namespace GMSCoop
                 if (Targets.BuyDelayedWithMarkers != null) yield return Targets.BuyDelayedWithMarkers;
             }
 
-            private static void Prefix() => _itemBuyDepth++;
-            private static void Finalizer() => _itemBuyDepth--;
+            private static void Prefix(object __instance) { _itemBuyDepth++; BuyStepBegin(__instance); }
+            private static void Finalizer(object __instance, bool __result) { _itemBuyDepth--; BuyStepEnd(__instance, __result); }
         }
 
         [HarmonyPatch]
@@ -1145,6 +1288,39 @@ namespace GMSCoop
                 if (p == null || !CanSend) return;
                 if (_itemBuyDepth > 0) SendSpawn(p, null, false, addToClaim: false);
                 else ObjectSync.ClaimLocal(p.gameObject);
+            }
+        }
+
+        // ---------- laptop deliveries (LaptopRepairParts -> LaptopDelivery "accept" -> TransactionHistoryItem.SpawnDelayed) ----------
+        // The delivery is instantiated at the depot on the accepting PC only. Loose physics items reached the
+        // others through ObjectSync's generic create, but machines (and anything not Syncable) never did:
+        // paid for, visible on one PC only. Every saved root object the step created is sent as a purchase.
+
+        [HarmonyPatch]
+        private static class PatchDeliverySpawn
+        {
+            private static MethodBase Target => MoveNextOf(typeof(TransactionHistoryItem), "SpawnDelayed");
+            private static bool Prepare() => Need(Target, "TransactionHistoryItem.SpawnDelayed MoveNext") != null;
+            private static MethodBase TargetMethod() => Target;
+
+            private static void Prefix(out int __state)
+            {
+                __state = -1;
+                if (!CanSend || !SaveSystem.Singleton<SaveSystem.CheckPointManagerBase>.IsInstanced()) return;
+                __state = SaveSystem.Singleton<SaveSystem.CheckPointManagerBase>.Instance.ToSave.Count;
+            }
+
+            private static void Postfix(int __state)
+            {
+                if (__state < 0 || !CanSend || !SaveSystem.Singleton<SaveSystem.CheckPointManagerBase>.IsInstanced()) return;
+                List<SaveSystem.SaveMe> all = SaveSystem.Singleton<SaveSystem.CheckPointManagerBase>.Instance.ToSave;
+                for (int i = __state; i < all.Count; i++)
+                {
+                    SaveSystem.SaveMe sm = all[i];
+                    if (sm == null || sm.transform.parent != null) continue; // parts of the delivered object
+                    SellableObject so = sm.GetComponent<SellableObject>();
+                    if (so != null) SendSpawn(so, null, false, addToClaim: false);
+                }
             }
         }
 
@@ -1175,7 +1351,7 @@ namespace GMSCoop
                 if (Targets.SpawnerSpawnTrailer != null) yield return Targets.SpawnerSpawnTrailer;
             }
 
-            private static void Prefix() => _ctx = new Ctx();
+            private static void Prefix(object __instance) { _ctx = new Ctx(); BuyStepBegin(__instance); }
 
             // The state machine keeps the parameter "trailer" as a field; with buy=true it is
             // reassigned to the newly instantiated trailer before the coroutine finishes.
@@ -1193,7 +1369,7 @@ namespace GMSCoop
                 SendSpawn(trailer, sameObj ? ctx.Place : null, sameObj && ctx.TeleportSetActive, addToClaim: false);
             }
 
-            private static void Finalizer() => _ctx = null;
+            private static void Finalizer(object __instance, bool __result) { _ctx = null; BuyStepEnd(__instance, __result); }
         }
 
         [HarmonyPatch]
@@ -1202,7 +1378,7 @@ namespace GMSCoop
             private static bool Prepare() => Targets.CarBuyObject != null;
             private static MethodBase TargetMethod() => Targets.CarBuyObject;
 
-            private static void Prefix() => _ctx = new Ctx { AddToClaim = true };
+            private static void Prefix(object __instance) { _ctx = new Ctx { AddToClaim = true }; BuyStepBegin(__instance); }
 
             // Final step: the vehicle was instantiated, passed to MyDepot.Teleport and added to the claim.
             private static void Postfix(bool __result)
@@ -1212,7 +1388,7 @@ namespace GMSCoop
                 SendSpawn(ctx.Obj, ctx.Place, ctx.TeleportSetActive, ctx.AddToClaim);
             }
 
-            private static void Finalizer() => _ctx = null;
+            private static void Finalizer(object __instance, bool __result) { _ctx = null; BuyStepEnd(__instance, __result); }
         }
 
         [HarmonyPatch]
@@ -1244,6 +1420,12 @@ namespace GMSCoop
                 Ctx ctx = _ctx;
                 if (ctx != null && ctx.Place == null && ctx.Obj != null && objectToTransport == ctx.Obj.gameObject)
                     ctx.Place = __instance;
+                // A depot move of anything but a vehicle (MachineSync sends those) outside a purchase of that
+                // object and outside a parcel reset (both send their own result).
+                if (_reset == null && objectToTransport != null && CanSend &&
+                    !(ctx != null && ctx.Obj != null && objectToTransport == ctx.Obj.gameObject) &&
+                    objectToTransport.GetComponent<MachineController>() == null && objectToTransport.GetComponent<Trailer>() == null)
+                    CaptureMove(__instance, objectToTransport, rotation, posOffset, setActive);
                 if (_reset != null && objectToTransport != null && !_applying)
                     _reset.Moves.Add(new ResetMove
                     {
@@ -1502,6 +1684,122 @@ namespace GMSCoop
             Plugin.Log.LogInfo($"Purchase sync: parcel reset of lot {lot} applied: {sold}/{destroyed.Count} sold, {moved} moved");
         }
 
+        // ---------- depot moves of loose objects and wash plants (transport service, laptop transport) ----------
+        // TransportGUI / LaptopTransport / TeleportToClosestClaim move objects with Depot.Teleport ->
+        // DepotPlace.TransportGameObject on the clicking PC only. Vehicles and trailers are sent by MachineSync
+        // (sub -6), but wash plants, generators, pumps and other loose objects stayed at the old claim on the
+        // other PCs (a teleport zeroes the velocity, so ObjectSync's motion claim never fired either): the
+        // host kept processing a wash plant that was gone for the player who moved it. The move is replayed
+        // with the same place, offset and rotation one frame later (objects the same call sells / returns
+        // are destroyed by then and skipped: their own message removes them).
+
+        private sealed class PendingMove
+        {
+            public GameObject Go;
+            public SoldRef Ref;      // captured before the first move (old position)
+            public string Place;
+            public Quaternion Rot;
+            public Vector3 Offset;
+            public bool SetActive;
+            public int Frame, Gen;
+        }
+
+        private static readonly List<PendingMove> PendingMoves = new List<PendingMove>();
+
+        private static void CaptureMove(DepotPlace place, GameObject go, Quaternion rot, Vector3 offset, bool setActive)
+        {
+            if (go.GetComponent<SellableObject>() == null) return;
+            PendingMove m = PendingMoves.Find(x => x.Go == go);
+            if (m == null)
+            {
+                if (PendingMoves.Count >= 256) return;
+                m = new PendingMove { Go = go, Ref = RefOf(go) };
+                m.Gen = ObjectSync.IndexGeneration; // after RefOf (may build the index)
+                PendingMoves.Add(m);
+            }
+            // GetFirstPlace may move an object twice in one call: the last place is the result.
+            m.Place = PathOf(place.transform);
+            m.Rot = rot;
+            m.Offset = offset;
+            m.SetActive = setActive;
+            m.Frame = Time.frameCount;
+        }
+
+        private static void FlushMoves()
+        {
+            for (int i = PendingMoves.Count - 1; i >= 0; i--)
+            {
+                PendingMove m = PendingMoves[i];
+                if (m.Frame >= Time.frameCount) continue; // DepotPlace / the caller finish this frame
+                PendingMoves.RemoveAt(i);
+                GameObject go = m.Go;
+                if (go == null || !Net.WorldLive) continue; // sold / returned meanwhile, or the world went away
+                Vector3 pos = go.transform.position;
+                Quaternion rot = go.transform.rotation;
+                bool active = go.activeSelf;
+                string area = AreaSceneOf(go.transform);
+                string name = go.name;
+                SendNamed(() =>
+                {
+                    var ms = BeginMsg(Kind.Move, out BinaryWriter w);
+                    WriteSoldRef(w, m.Ref);
+                    w.Write(m.Place ?? "");
+                    WriteQ(w, m.Rot);
+                    WriteV3(w, m.Offset);
+                    w.Write(m.SetActive);
+                    WriteV3(w, pos);
+                    WriteQ(w, rot);
+                    w.Write(active);
+                    w.Write(area);
+                    return ms.ToArray();
+                }, () =>
+                {
+                    // Keyed physics object: this PC streams it / sends its exact rest pose at the new place.
+                    if (go != null && go.activeInHierarchy) ObjectSync.ClaimLocal(go);
+                    Plugin.Log.LogInfo("Purchase sync: sent depot move of " + name);
+                }, m.Gen);
+            }
+        }
+
+        private static void ReceiveMove(BinaryReader r)
+        {
+            SoldRef d = ReadSoldRef(r);
+            string placePath = r.ReadString();
+            Quaternion prot = ReadQ(r);
+            Vector3 offset = ReadV3(r);
+            bool setActive = r.ReadBoolean();
+            Vector3 pos = ReadV3(r);
+            Quaternion rot = ReadQ(r);
+            bool active = r.ReadBoolean();
+            string areaScene = r.ReadString();
+            GameObject go = ResolveSold(d, null);
+            if (go == null) { Plugin.Log.LogWarning("Purchase sync: moved object not found here: " + d.SaveId); return; }
+            // Something the local player holds / uses: freed first (as for a sale).
+            ExitIfLocallyInside(go);
+            if (global::Singleton<GravityGun>.IsInstanced() && global::Singleton<GravityGun>.Instance.PickedObject == go)
+                global::Singleton<GravityGun>.Instance.DropObject(false);
+            DepotPlace place = placePath.Length > 0 ? Resolve(placePath)?.GetComponent<DepotPlace>() : null;
+            bool done = false;
+            if (place != null)
+            {
+                try { place.TransportGameObject(go, prot, offset, setActive); done = true; }
+                catch (Exception ex) { Plugin.Log.LogWarning("Purchase sync: depot move failed: " + ex.Message); }
+            }
+            // Place not loaded here (or the move failed): the mover's final pose, under the area it belongs to.
+            if (!done)
+            {
+                go.transform.SetPositionAndRotation(pos, rot);
+                AreaStreamer area = FindArea(areaScene) ?? ObjectSync.AreaAt(pos);
+                if (area != null) ObjectSync.ParentToArea(go, area);
+                var rb = go.GetComponent<Rigidbody>();
+                if (rb != null && !rb.isKinematic) { rb.velocity = Vector3.zero; rb.angularVelocity = Vector3.zero; }
+            }
+            // StoreDepotPlace sets the active state after its base call (the captured flag is the base's).
+            if (go.activeSelf != active) go.SetActive(active);
+            ObjectSync.AcceptHolderState(go); // the mover's game unhooked the same hoses / ropes
+            Plugin.Log.LogInfo("Purchase sync: depot move applied: " + go.name);
+        }
+
         // ---------- rentals ----------
 
         [HarmonyPatch]
@@ -1535,6 +1833,36 @@ namespace GMSCoop
                 if (m == null || !CanSend) return;
                 SendRef(Kind.RentReturn, m);
                 ObjectSync.ForgetQuiet(m.gameObject); // the game destroys it now; no generic Destroy echo
+            }
+        }
+
+        /// <summary>
+        /// The sell zone's "buy rented" button (SellGUI.BuyRentedObjects -> BuyObjects) buys out every rented
+        /// machine standing in the zone. Only the money travelled (ledger): the other PCs kept the machine
+        /// rented, so the host went on charging its daily rent and could even take it back
+        /// (Finance.ReturnMachine) although the player had paid for it. Same RentBuyout as the laptop.
+        /// </summary>
+        [HarmonyPatch]
+        private static class PatchSellZoneBuyout
+        {
+            private static MethodBase Target => AccessTools.Method(typeof(SellGUI), nameof(SellGUI.BuyObjects), Type.EmptyTypes);
+            private static bool Prepare() => Need(Target, "SellGUI.BuyObjects()") != null;
+            private static MethodBase TargetMethod() => Target;
+
+            private static void Prefix(SellGUI __instance, out List<SellableObject> __state)
+            {
+                __state = null;
+                if (__instance == null || __instance.Items == null || !CanSend) return;
+                foreach (CashRegisterItem item in __instance.Items)
+                    if (item != null && item.isRented && item.MySellObject != null && item.MySellObject.IsRented)
+                        (__state ??= new List<SellableObject>()).Add(item.MySellObject);
+            }
+
+            private static void Postfix(List<SellableObject> __state)
+            {
+                if (__state == null) return;
+                foreach (SellableObject so in __state)
+                    if (so != null && !so.IsRented) SendRef(Kind.RentBuyout, so);
             }
         }
 

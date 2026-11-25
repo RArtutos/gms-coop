@@ -173,9 +173,12 @@ namespace GMSCoop
         {
             if (id < 0) id = MachineSync.IdOf(m);
 
-            // The local player sits in it (passenger taking over as driver): keep the cargo frozen,
-            // the game unfreezes it when we get out, and tell the others what we carry.
-            bool localInside = m != null && m.IsControlled();
+            // The local player takes over as the driver (sits in it and is not just riding along): keep the
+            // cargo frozen, the game unfreezes it when we get out, and tell the others what we carry.
+            // A passenger who stays a passenger does not drive: the driver's Unfreeze applies to it like to
+            // everyone else (kept frozen, the cargo stayed frozen on the passenger's PC only, for good: the
+            // game's 10 s auto-unfreeze needs a player who controls no machine, and the passenger "controls" it).
+            bool localInside = m != null && m.IsControlled() && !PassengerSync.RidesAlongIn(m);
 
             List<KeyValuePair<TransportBed, Held>> release = null;
             foreach (var kv in HeldBeds)
@@ -381,7 +384,7 @@ namespace GMSCoop
             {
                 PendingFreeze.Remove(Slot(id, slot));
                 if (HeldBeds.ContainsKey(bed)) PendingUnfreeze[Slot(id, slot)] = snap; // applied on release
-                else if (!m.IsControlled())
+                else if (!m.IsControlled() || PassengerSync.RidesAlongIn(m)) // a passenger is not the driver
                 {
                     ulong last = MachineSync.LastDriverOf(id);
                     if (last == 0 || last == sender) ApplyUnfreeze(bed, slot, snap);

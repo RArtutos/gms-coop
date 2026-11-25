@@ -412,7 +412,9 @@ namespace GMSCoop
             float now = Time.unscaledTime;
             uint seq = ++_seq;
             int nOps = withOps ? Mathf.Min(LoanOps.Count, 255) : 0;
-            var p = new Pend { Seq = seq, D = d, T = now, Loans = nOps > 0, Undo = undo };
+            bool loans = false;
+            for (int i = 0; i < nOps; i++) loans |= LoanOps[i].Kind != SpendCheck;
+            var p = new Pend { Seq = seq, D = d, T = now, Loans = loans, Undo = undo };
             if (withStats) { p.Earn = _statEarn; p.Km = _statKm; _statEarn = _statKm = 0f; }
             Pending.Add(p);
             var ms = Begin(SubDelta, out BinaryWriter w);
@@ -468,6 +470,35 @@ namespace GMSCoop
         // ================================================================== loans
 
         private const byte LoanAdd = 1, LoanPayFirst = 2, LoanPartFirst = 3;
+        /// <summary>Marker op (no loan): the host checks this delta's CASH against its balance too (purchases).</summary>
+        private const byte SpendCheck = 0;
+
+        /// <summary>Client, before a purchase: earlier changes are folded away so the purchase travels alone.</summary>
+        internal static void CheckedSpendBegin() => IsolateBegin();
+
+        /// <summary>
+        /// Client, after a purchase: its money change is sent alone, marked so the host refuses it when its own
+        /// cash no longer covers it (two players buying with the same money at once). Returns the delta's
+        /// sequence (0 = nothing spent / not a client). <paramref name="onRefused"/> runs if the host refuses it.
+        /// </summary>
+        internal static uint CheckedSpendEnd(Action onRefused)
+        {
+            if (!IsClientSynced() || !_based) return 0;
+            Gsm g = GsmInst;
+            if (g == null) return 0;
+            TakeFrame(g);
+            if (!NonZero(Frame)) return 0;
+            LoanOps.Add(new LoanOp { Kind = SpendCheck });
+            SendIsolated(Frame, onRefused != null ? new List<Action> { onRefused } : null);
+            return _seq;
+        }
+
+        /// <summary>Client: the host has not answered this delta yet (neither applied nor refused).</summary>
+        internal static bool SpendPending(uint seq)
+        {
+            foreach (Pend p in Pending) if (p.Seq == seq) return true;
+            return false;
+        }
 
         private struct LoanOp
         {
@@ -525,6 +556,7 @@ namespace GMSCoop
         /// <summary>Host: a client's loan operation, applied to the host's own list.</summary>
         private static void ApplyLoanOp(LoanOp op)
         {
+            if (op.Kind == SpendCheck) return; // marker only (the overdraft check already ran)
             List<Finance.Credit> list = CreditList();
             if (list == null) return;
             switch (op.Kind)
@@ -1373,7 +1405,10 @@ namespace GMSCoop
         {
             if (w == null) return null;
             Worker.WorkerImageInfo i = w.ImageInfo;
-            return i == null
+            // WorkerImageInfo overloads == / != without a null check (it reads obj2.Unique): "i == null"
+            // threw a NullReferenceException for every worker, so the roster check failed every time the
+            // crew changed and no departure was ever sent. Reference comparison only.
+            return ReferenceEquals(i, null)
                 ? w.Name + "|" + w.IsMen
                 : w.Name + "|" + w.IsMen + "|" + i.Unique + "," + i.Eyes + "," + i.Hair + "," + i.Head + "," + i.Nose + "," + i.Mouth + "," + i.Clothes + "," + i.Background;
         }
@@ -1437,12 +1472,50 @@ namespace GMSCoop
             private static MethodBase TargetMethod() => Need(typeof(Worker), nameof(Worker.CollectSalary), "host-only worker salary");
             private static bool Prepare() => TargetMethod() != null;
 
-            private static bool Prefix(Worker __instance)
+            private static bool Prefix(Worker __instance, bool oneDollar)
             {
-                if (!IsClientSynced()) return true;
-                __instance.MyDailyEarning = 0f;
-                __instance.Preformance += 0.01f;
-                return false;
+                if (IsClientSynced())
+                {
+                    __instance.MyDailyEarning = 0f;
+                    __instance.Preformance += 0.01f;
+                    return false;
+                }
+                // Game bug: a worker that cannot be paid removes itself from WorkersManager.MyWorkers inside
+                // WorkersManager.Update's foreach. The enumerator then throws, LastPaymentDay is not advanced and
+                // the next frame runs payday again (with the one-dollar promo every worker is charged again).
+                // The departure is deferred to the end of that Update (PatchWorkersUpdate): each worker is paid
+                // exactly once per payday, single player included.
+                try
+                {
+                    if (__instance == null || !global::Singleton<GoldDigger.WorkersManager>.IsInstanced()) return true;
+                    if (oneDollar) __instance.MyDailyEarning = 1f;
+                    if (!(global::Singleton<GoldDigger.GameStateManager>.Instance.Cash < __instance.MyDailyEarning)) return true;
+                    if (!WorkersLeaving.Contains(__instance)) WorkersLeaving.Add(__instance);
+                    string left = __instance.Name + new LocalizationKey("WORKER_LEFT_YOU").GetLocalized();
+                    global::Singleton<HUD>.Instance.ShowHint(left, left);
+                    return false;
+                }
+                catch (Exception) { return true; }
+            }
+        }
+
+        private static readonly List<Worker> WorkersLeaving = new List<Worker>();
+
+        [HarmonyPatch]
+        private static class PatchWorkersUpdate
+        {
+            private static MethodBase TargetMethod() => Need(typeof(GoldDigger.WorkersManager), "Update", "worker departures on payday", Type.EmptyTypes);
+            private static bool Prepare() => TargetMethod() != null;
+
+            private static Exception Finalizer(Exception __exception, GoldDigger.WorkersManager __instance)
+            {
+                if (WorkersLeaving.Count > 0)
+                {
+                    try { if (__instance != null) foreach (Worker w in WorkersLeaving) __instance.MyWorkers.Remove(w); }
+                    catch (Exception) { /* list gone with the world */ }
+                    WorkersLeaving.Clear();
+                }
+                return __exception;
             }
         }
 
@@ -1681,7 +1754,9 @@ namespace GMSCoop
             decimal amount = 0m;
             if (granted)
             {
-                amount = f.tmpGoldAmount != null ? f.tmpGoldAmount.Value : 0m;
+                // FixedDecimal overloads != (AlignAndOperate reads both operands): "tmpGoldAmount != null"
+                // threw, the claim was never answered and a client could never collect its remelted bars.
+                amount = !ReferenceEquals(f.tmpGoldAmount, null) ? f.tmpGoldAmount.Value : 0m;
                 f.goldIsRemelted = false; // collected (the forge sync tells everyone)
                 f.remeltingInProgress = false;
                 BlacksmithCraftGUI gui = UnityEngine.Object.FindObjectOfType<BlacksmithCraftGUI>();

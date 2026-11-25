@@ -105,7 +105,8 @@ namespace GMSCoop
         // prices than the host. The host sends its values whenever they change and to every new client.
         private static readonly int[] Sent = new int[SettingKeys.Length];
         private static readonly HashSet<ulong> SettingsSentTo = new HashSet<ulong>();
-        private static float _nextHostCheck;
+        private static float _nextHostCheck, _resendAt;
+        private static int _sentWorld = int.MinValue;
 
         private static void HostSync()
         {
@@ -119,6 +120,21 @@ namespace GMSCoop
             {
                 int v = s.HasKey(SettingKeys[i]) ? s.GetInt(SettingKeys[i]) : int.MinValue;
                 if (v != Sent[i]) { Sent[i] = v; changed = true; }
+            }
+            // The host (re)loaded a world: the clients reload it too, and the save load copies that save's values
+            // into their settings (GameStateManager.Deserialize), which may be older than the host's current
+            // ones. Send again once the host plays, and once more a little later for clients still loading.
+            int world = GameState.WorldVersion;
+            if (world != _sentWorld && !GameState.IsLoading)
+            {
+                _sentWorld = world;
+                changed = true;
+                _resendAt = now + 15f;
+            }
+            else if (_resendAt > 0f && now >= _resendAt)
+            {
+                _resendAt = 0f;
+                changed = true;
             }
             if (changed) SettingsSentTo.Clear();
             SettingsSentTo.RemoveWhere(p => !Net.Peers.Contains(p));

@@ -640,6 +640,9 @@ namespace GMSCoop
         /// <summary>LocalId of the remote player driving this machine right now, or 0.</summary>
         internal static ulong DriverOf(int id) => Remotes.TryGetValue(id, out var rem) ? rem.Driver : 0UL;
 
+        /// <summary>True while the remote drive of machine <paramref name="id"/> is playing out its driver's exit.</summary>
+        internal static bool RemoteExiting(int id) => Remotes.TryGetValue(id, out var rem) && rem.Exiting;
+
         /// <summary>LocalId of the last remote player that drove this machine (also after the drive ended), or 0.</summary>
         internal static ulong LastDriverOf(int id) => LastDriver.TryGetValue(id, out ulong d) ? d : 0UL;
 
@@ -1872,12 +1875,32 @@ namespace GMSCoop
                 return false;
             }
 
-            private static void Prefix(Trailer __instance)
+            // Trailer.Disconnect flips the lever / toggle visuals at once and clears _Hook.IsConnected only 1 s
+            // later (DisconnectCor). A hose attached to a hitched mobile wash plant / cistern / pump unhitches it
+            // through that path on every PC (the attach is replayed); the actor's unhitch (sub -2) arriving inside
+            // that second still saw IsConnected and toggled the levers a second time (back to "hitched").
+            // A second unhitch of a trailer that is already unhitching is skipped.
+            private static readonly Dictionary<Trailer, float> Unhitching = new Dictionary<Trailer, float>();
+
+            private static bool Prefix(Trailer __instance, MethodBase __originalMethod)
             {
-                if (_applyingHitch || PurchaseApplying() || !Net.Active || GameState.IsLoading) return;
-                if (__instance._Hook == null || !__instance._Hook.IsConnected) return;
+                if (__instance == null) return true;
+                float now = Time.unscaledTime;
+                if (Unhitching.TryGetValue(__instance, out float until))
+                {
+                    if (now < until) return false;
+                    Unhitching.Remove(__instance);
+                }
+                if (__instance._Hook == null || !__instance._Hook.IsConnected) return true;
+                if (__originalMethod.Name == "Disconnect")
+                {
+                    if (Unhitching.Count > 32) Unhitching.Clear();
+                    Unhitching[__instance] = now + 1.5f;
+                }
+                if (_applyingHitch || PurchaseApplying() || !Net.Active || GameState.IsLoading) return true;
                 try { SendHitch(__instance, PickupOf(__instance), false); }
                 catch (Exception ex) { Plugin.Log.LogWarning("Machine sync: unhitch send: " + ex.Message); }
+                return true;
             }
         }
 

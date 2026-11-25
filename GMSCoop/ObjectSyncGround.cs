@@ -40,6 +40,9 @@ namespace GMSCoop
         private static readonly Dictionary<Entry, int> GroundHits = new Dictionary<Entry, int>();
         private static readonly Dictionary<Entry, Vector3> GroundGood = new Dictionary<Entry, Vector3>();
         private static readonly List<Collider> _groundCols = new List<Collider>();
+        private static readonly List<Collider> _terrainCols = new List<Collider>();
+        private static Terrain[] _terrains;
+        private static int _terrainsFrame = -1;
 
         /// <summary>Called from Tick at the send rate.</summary>
         private static void GroundGuardTick()
@@ -54,11 +57,28 @@ namespace GMSCoop
             int budget = Mathf.Min(GroundChecksPerTick, All.Count);
             for (int i = 0; i < budget; i++)
             {
-                if (_groundCursor >= All.Count) _groundCursor = 0;
+                if (_groundCursor >= All.Count)
+                {
+                    _groundCursor = 0;
+                    PruneGround(); // once per round: entries forgotten meanwhile (destroyed clods...) are never visited again
+                }
                 Entry e = All[_groundCursor++];
                 try { CheckGround(e); }
                 catch (System.Exception ex) { VehicleTraffic.Warn("ground guard", "Object sync: ground check failed: " + ex.Message); }
             }
+        }
+
+        private static readonly List<Entry> _groundDead = new List<Entry>();
+
+        private static bool Forgotten(Entry e) =>
+            e.Go == null || !ByInstance.TryGetValue(e.InstanceId, out Entry cur) || cur != e;
+
+        private static void PruneGround()
+        {
+            foreach (Entry e in GroundGood.Keys) if (Forgotten(e)) _groundDead.Add(e);
+            foreach (Entry e in GroundHits.Keys) if (Forgotten(e)) _groundDead.Add(e);
+            foreach (Entry e in _groundDead) { GroundGood.Remove(e); GroundHits.Remove(e); }
+            _groundDead.Clear();
         }
 
         private static void CheckGround(Entry e)
@@ -71,8 +91,9 @@ namespace GMSCoop
             }
             Rigidbody rb = e.Rb;
             // Only copies this PC simulates: the owner streams followed / held objects, holders and beds carry theirs.
+            // FreezeAll: held still by a load window (WorldStreaming) until the area under it is complete.
             if (e.Part || e.Following || e.HeldBy != 0 || e == _localEntry || e.Attached || rb.isKinematic ||
-                !e.Go.activeSelf || Frozen(e) || Active.Contains(e))
+                !e.Go.activeSelf || Frozen(e) || Active.Contains(e) || rb.constraints == RigidbodyConstraints.FreezeAll)
             {
                 GroundHits.Remove(e);
                 return;
@@ -82,10 +103,15 @@ namespace GMSCoop
             AreaStreamer area = AreaAt(pos);
             if (area != null && (area.loading || area.unloading || area.unloadingwait)) { GroundHits.Remove(e); return; }
             if (!e.Go.activeInHierarchy) { GroundHits.Remove(e); return; } // parked in an unloaded area / inactive parent
-            if (area != null && area.GameplayObjects != null && !area.GameplayObjects.gameObject.activeInHierarchy)
+            // Another player's edits for the tile under it are still queued: the surface is not final yet.
+            if (TerrainSync.HasPendingAt(pos)) { GroundHits.Remove(e); return; }
+            if (area != null && area.GameplayObjects != null && !area.GameplayObjects.gameObject.activeInHierarchy &&
+                !SurfaceAt(pos, out _) && !SolidBelow(rb, pos))
             {
-                // Active in an area that is not loaded here: nothing to stand on. Park it there (inactive) at
-                // its last pose on the ground, as the game keeps that area's objects.
+                // Active in an area that is not loaded here and nothing at all under it (the load bounds of
+                // areas overlap: an object on a loaded neighbour's terrain or on base-scene ground is left
+                // alone). Park it there (inactive) at its last pose on the ground, as the game keeps that
+                // area's objects.
                 if (!Bump(e)) return;
                 if (GroundGood.TryGetValue(e, out Vector3 good) && good.y > pos.y + 1f) MoveBody(e, good);
                 ParkInUnloadedArea(e.Go, rb.position);
@@ -94,11 +120,21 @@ namespace GMSCoop
                 return;
             }
 
-            if (!TryBounds(e.Go, out Bounds b)) return;
+            if (!TryBounds(e, out Bounds b)) return;
             if (!SurfaceAt(b.center, out float surface)) { GroundHits.Remove(e); return; }
 
             float depth = surface - b.center.y;
-            bool sunk = depth > GroundSunkDepth || (depth > GroundFallDepth && rb.velocity.y < -GroundFallSpeed);
+            bool falling = rb.velocity.y < -GroundFallSpeed;
+            bool sunk = depth > GroundSunkDepth || (depth > GroundFallDepth && falling);
+            if (sunk)
+            {
+                // Under the surface over its whole footprint, not just at its centre: an object at the foot of
+                // a dig pit wall has the wall's steep slope above its centre while it rests on the pit floor.
+                depth = FootprintSurface(b, surface) - b.center.y;
+                sunk = depth > GroundSunkDepth || (depth > GroundFallDepth && falling);
+                // The mine, a cave or a cellar: a roof between it and the terrain surface, it is not buried.
+                if (sunk && UnderRoof(b, surface)) sunk = false;
+            }
             if (!sunk)
             {
                 GroundHits.Remove(e);
@@ -142,27 +178,35 @@ namespace GMSCoop
         private const float EditMargin = 0.5f;     // around the edited cells (x/z)
         private const float EditHeight = 4f;       // above / below the edited heights
         private const float EditRestGap = 0.3f;    // lowest point at most this far above the old surface: resting on it
+        private const float EditSunkGap = 1f;      // lowest point more than this under the old surface: not resting on it
+        private const float EditObjectReach = 3f;  // body position to the edge of its colliders, for the candidate search
         private const int MaxEditLifts = 32;       // per rebuild
 
         private static readonly List<EditCandidate> _editCands = new List<EditCandidate>();
         private static readonly HashSet<Entry> _editSeen = new HashSet<Entry>();
-        private static readonly Collider[] _editHits = new Collider[256];
         private static int _editLogs;
+
+        /// <summary>The object's bounds reach into the edited area (grown by the margins).</summary>
+        private static bool NearEdit(Bounds b, Bounds area) =>
+            b.max.x >= area.min.x - EditMargin && b.min.x <= area.max.x + EditMargin &&
+            b.max.z >= area.min.z - EditMargin && b.min.z <= area.max.z + EditMargin &&
+            b.max.y >= area.min.y - EditHeight && b.min.y <= area.max.y + EditHeight;
 
         /// <summary>TerrainSync, before rebuilding a tile's collider: remember the loose objects in <paramref name="area"/> and their surface.</summary>
         internal static void TerrainEditBegin(Bounds area)
         {
             if (!Net.Active || !_indexed || !Ready) return;
-            Vector3 half = area.extents + new Vector3(EditMargin, EditHeight, EditMargin);
-            int n = Physics.OverlapBoxNonAlloc(area.center, half, _editHits, Quaternion.identity, ~0, QueryTriggerInteraction.Ignore);
-            for (int i = 0; i < n; i++)
+            // Every keyed object, by its body position: a physics overlap with a fixed hit buffer filled up with
+            // trees, rocks and other static colliders around a big edit and missed loose objects. The search
+            // box is grown by EditObjectReach for large objects, then their collider bounds are tested.
+            Bounds near = area;
+            near.Expand(new Vector3(2f * (EditMargin + EditObjectReach), 2f * (EditHeight + EditObjectReach), 2f * (EditMargin + EditObjectReach)));
+            foreach (Entry e in All)
             {
-                Collider col = _editHits[i];
-                _editHits[i] = null;
-                Rigidbody rb = col != null ? col.attachedRigidbody : null;
-                if (rb == null || rb.isKinematic || !ByInstance.TryGetValue(rb.gameObject.GetInstanceID(), out Entry e)) continue;
+                Rigidbody rb = e.Rb;
+                if (rb == null || e.Go == null || rb.isKinematic || !near.Contains(rb.position)) continue;
                 if (!_editSeen.Add(e) || !EditMovable(e)) continue;
-                if (!TryBounds(e.Go, out Bounds b) || !SurfaceAt(b.center, out float surface)) continue;
+                if (!TryBounds(e, out Bounds b) || !NearEdit(b, area) || !SurfaceAt(b.center, out float surface)) continue;
                 _editCands.Add(new EditCandidate { E = e, OldSurface = surface });
             }
         }
@@ -178,15 +222,17 @@ namespace GMSCoop
                 {
                     Entry e = c.E;
                     if (e.Go == null || e.Rb == null || !EditMovable(e)) continue;
-                    if (!TryBounds(e.Go, out Bounds b) || !SurfaceAt(b.center, out float surface)) continue;
+                    if (!TryBounds(e, out Bounds b) || !SurfaceAt(b.center, out float surface)) continue;
                     float rise = surface - c.OldSurface;
                     if (rise < -0.02f)
                     {
                         e.Rb.WakeUp(); // the ground dropped under it: let it settle into the pit
                         continue;
                     }
-                    // Lift only what rested on the old surface and is now under the new one.
-                    if (rise <= 0.02f || b.min.y > c.OldSurface + EditRestGap || surface <= b.min.y) continue;
+                    // Lift only what rested on the old surface (not far under it: the mine or a cellar under the
+                    // edit, or something already buried) and is now under the new one.
+                    if (rise <= 0.02f || b.min.y > c.OldSurface + EditRestGap || b.min.y < c.OldSurface - EditSunkGap ||
+                        surface <= b.min.y) continue;
                     if (lifts >= MaxEditLifts) break;
                     lifts++;
                     if (e.Owner != Net.LocalId) LocalClaim(e, grab: false);
@@ -237,15 +283,19 @@ namespace GMSCoop
             e.Go.transform.position = pos;
         }
 
-        /// <summary>World bounds of the object's solid colliders.</summary>
-        private static bool TryBounds(GameObject go, out Bounds b)
+        /// <summary>
+        /// World bounds of the object's own solid colliders: those of its body, not of a child body (rope hook)
+        /// or of something parented under one of its holders (a shovel in a dirt box holder).
+        /// </summary>
+        private static bool TryBounds(Entry e, out Bounds b)
         {
             b = default;
             bool any = false;
-            go.GetComponentsInChildren(false, _groundCols);
+            Rigidbody rb = e.Rb;
+            e.Go.GetComponentsInChildren(false, _groundCols);
             foreach (Collider c in _groundCols)
             {
-                if (c == null || c.isTrigger || !c.enabled) continue;
+                if (c == null || c.isTrigger || !c.enabled || c.attachedRigidbody != rb) continue;
                 if (!any) { b = c.bounds; any = true; }
                 else b.Encapsulate(c.bounds);
             }
@@ -253,14 +303,85 @@ namespace GMSCoop
             return any;
         }
 
+        /// <summary>
+        /// Lowest loaded terrain surface under the object's footprint: <paramref name="center"/> (the surface at
+        /// its centre) and its bounds' x/z corners pulled in a little.
+        /// </summary>
+        private static float FootprintSurface(Bounds b, float center)
+        {
+            float low = center;
+            Vector3 c = b.center, ext = b.extents * 0.8f;
+            for (int i = 0; i < 4; i++)
+            {
+                var p = new Vector3(c.x + ((i & 1) == 0 ? -ext.x : ext.x), c.y, c.z + ((i & 2) == 0 ? -ext.z : ext.z));
+                if (SurfaceAt(p, out float s) && s < low) low = s;
+            }
+            return low;
+        }
+
+        private static readonly RaycastHit[] _rayHits = new RaycastHit[16];
+
+        /// <summary>
+        /// A static (body-less, non-terrain) collider clearly under the terrain surface above the object: it is
+        /// in the mine, a cave or a cellar, not buried. Rock bases sunk a little into the ground do not count.
+        /// </summary>
+        private static bool UnderRoof(Bounds b, float surface)
+        {
+            if (InMine(b.center)) return true;
+            float len = surface - b.center.y;
+            if (len <= 0f) return false;
+            int n = Physics.RaycastNonAlloc(b.center, Vector3.up, _rayHits, len, ~0, QueryTriggerInteraction.Ignore);
+            bool roof = false;
+            for (int i = 0; i < n; i++)
+            {
+                Collider col = _rayHits[i].collider;
+                if (!roof && col != null && col.attachedRigidbody == null && col.GetType().Name != "TerrainCollider" &&
+                    _rayHits[i].point.y < surface - 1f)
+                    roof = true;
+                _rayHits[i] = default;
+            }
+            return roof;
+        }
+
+        /// <summary>Inside the game's mine volume (MineEntranceController.mineCollider, its own "player inside" test).</summary>
+        private static bool InMine(Vector3 p)
+        {
+            MineEntranceController mine = MineEntranceController.instance;
+            if (mine == null) return false;
+            Collider mc = mine.mineCollider;
+            if (mc == null || !mc.enabled || !mc.gameObject.activeInHierarchy || !mc.bounds.Contains(p)) return false;
+            // ClosestPoint needs a primitive or convex collider; otherwise the box test has to do.
+            if (mc is MeshCollider mesh && !mesh.convex) return true;
+            return (mc.ClosestPoint(p) - p).sqrMagnitude < 1e-6f;
+        }
+
+        /// <summary>Anything solid (other than the object itself) straight under <paramref name="pos"/>.</summary>
+        private static bool SolidBelow(Rigidbody rb, Vector3 pos)
+        {
+            int n = Physics.RaycastNonAlloc(pos + Vector3.up * 0.5f, Vector3.down, _rayHits, 1000f, ~0, QueryTriggerInteraction.Ignore);
+            bool solid = false;
+            for (int i = 0; i < n; i++)
+            {
+                Collider col = _rayHits[i].collider;
+                if (!solid && col != null && col.attachedRigidbody != rb) solid = true;
+                _rayHits[i] = default;
+            }
+            return solid;
+        }
+
         /// <summary>Loaded terrain surface (nearest to <paramref name="p"/>) at <paramref name="p"/>'s x/z (terrain holes let the raycast through).</summary>
         private static bool SurfaceAt(Vector3 p, out float surface)
         {
             surface = 0f;
             bool found = false;
-            Terrain[] terrains = Terrain.activeTerrains;
-            if (terrains == null) return false;
-            foreach (Terrain t in terrains)
+            // activeTerrains allocates a new array per call: once per frame (a check makes several calls).
+            if (_terrainsFrame != Time.frameCount || _terrains == null)
+            {
+                _terrains = Terrain.activeTerrains;
+                _terrainsFrame = Time.frameCount;
+            }
+            if (_terrains == null) return false;
+            foreach (Terrain t in _terrains)
             {
                 if (t == null || t.terrainData == null || !t.isActiveAndEnabled) continue;
                 Vector3 o = t.GetPosition();
@@ -268,8 +389,10 @@ namespace GMSCoop
                 if (p.x < o.x || p.z < o.z || p.x > o.x + size.x || p.z > o.z + size.z) continue;
                 // TerrainCollider (by name: its module is not referenced).
                 Collider tc = null;
-                foreach (Collider c in t.GetComponents<Collider>())
+                t.GetComponents(_terrainCols); // no array allocation (runs for every ground check)
+                foreach (Collider c in _terrainCols)
                     if (c != null && c.enabled && c.GetType().Name == "TerrainCollider") { tc = c; break; }
+                _terrainCols.Clear();
                 if (tc == null) continue;
                 var ray = new Ray(new Vector3(p.x, o.y + size.y + 10f, p.z), Vector3.down);
                 // Several tiles can cover one spot (a claim's dig terrain inside the main terrain): the surface

@@ -1688,7 +1688,11 @@ namespace GMSCoop
                 if ((!authoritative || force) && fuelQ != ushort.MaxValue && m.Fuel != null && m.Fuel.Enabled)
                 {
                     float f = fuelQ / 65534f;
-                    if (Mathf.Abs(m.Fuel.TankPct - f) > 0.0005f) m.Fuel.TankPct = f;
+                    // A refuel on foot of a parked machine runs on every PC (the fuel pistol attach is replayed), so
+                    // both PCs publish their rising value: taking the other's older, lower value stepped the tank back
+                    // and forth while filling. On-foot updates only ever raise it (passive burn runs alike here).
+                    bool onFootLower = !fromDriver && !force && f < m.Fuel.TankPct;
+                    if (!onFootLower && Mathf.Abs(m.Fuel.TankPct - f) > 0.0005f) m.Fuel.TankPct = f;
                 }
                 for (int i = 0; i < n; i++)
                 {
